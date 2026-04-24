@@ -100,10 +100,9 @@ function resolveGatewayBaseUrl() {
     return configuredGateway.trim();
   }
 
-  try {
-    window.localStorage.removeItem("hermesGatewayBaseUrl");
-  } catch {
-    // Ignore storage errors in locked-down WebViews.
+  const storedGateway = safeStorageGetItem(window.localStorage, "hermesGatewayBaseUrl");
+  if (storedGateway && storedGateway.trim()) {
+    return storedGateway.trim();
   }
 
   return getDefaultGatewayBaseUrl();
@@ -2108,10 +2107,11 @@ function applyWritebackResultToMessage(message, result) {
   delete message.pendingCompletion;
 }
 
-function buildPendingWritebackCompletionRequest(message, approval, result) {
+function buildPendingWritebackCompletionRequest(message, approval, result, workbookSessionKey) {
   return {
     requestId: message.requestId,
     runId: message.runId,
+    ...(workbookSessionKey ? { workbookSessionKey } : {}),
     approvalToken: approval.approvalToken,
     planDigest: approval.planDigest,
     result
@@ -4434,7 +4434,8 @@ async function executeWritePlanMessage(message) {
     message.pendingCompletion = buildPendingWritebackCompletionRequest(
       message,
       approval,
-      gatewayResult
+      gatewayResult,
+      workbookSessionKey
     );
 
     await gateway.completeWrite(message.pendingCompletion);

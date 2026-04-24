@@ -367,6 +367,7 @@ describe("writeback confirmation flow", () => {
       body: {
         requestId: "req_composite_complete_001",
         runId: "run_composite_complete_001",
+        workbookSessionKey: "excel_windows::workbook-123",
         approvalToken: (approval.body as any).approvalToken,
         planDigest: (approval.body as any).planDigest,
         result: {
@@ -983,6 +984,7 @@ describe("writeback confirmation flow", () => {
     expect(() => completeWriteback({
       requestId: "req|pipe",
       runId: "run_pipe",
+      workbookSessionKey: "excel_windows::workbook-123",
       approvalToken: approval.approvalToken,
       planDigest: approval.planDigest,
       result: buildRangeWriteResult(plan),
@@ -1150,6 +1152,70 @@ describe("writeback confirmation flow", () => {
       404,
       "RUN_NOT_FOUND",
       "That Hermes request is no longer available."
+    );
+  });
+
+  it("rejects completion when the workbook session does not match the approved session", () => {
+    const traceBus = new TraceBus();
+    const plan = {
+      sourceSheet: "Sales",
+      sourceRange: "A1:F50",
+      targetSheet: "Sales Pivot",
+      targetRange: "A1",
+      rowGroups: ["Region"],
+      valueAggregations: [{ field: "Revenue", aggregation: "sum" }],
+      explanation: "Build a sales pivot by region.",
+      confidence: 0.9,
+      requiresConfirmation: true as const,
+      affectedRanges: ["Sales!A1:F50", "Sales Pivot!A1"],
+      overwriteRisk: "low" as const,
+      confirmationLevel: "standard" as const
+    };
+
+    setRunResponse(traceBus, {
+      runId: "run_session_mismatch",
+      requestId: "req_session_mismatch",
+      type: "pivot_table_plan",
+      traceEvent: "pivot_table_plan_ready",
+      plan
+    });
+
+    const approval = invokeWritebackRoute({
+      traceBus,
+      path: "/approve",
+      body: {
+        requestId: "req_session_mismatch",
+        runId: "run_session_mismatch",
+        workbookSessionKey: "excel_windows::workbook-123",
+        plan
+      }
+    });
+    expect(approval.status).toBe(200);
+
+    const response = invokeWritebackRoute({
+      traceBus,
+      path: "/complete",
+      body: {
+        requestId: "req_session_mismatch",
+        runId: "run_session_mismatch",
+        workbookSessionKey: "excel_windows::workbook-456",
+        approvalToken: (approval.body as any).approvalToken,
+        planDigest: (approval.body as any).planDigest,
+        result: {
+          kind: "pivot_table_update",
+          operation: "pivot_table_update",
+          hostPlatform: "excel_windows",
+          ...plan,
+          summary: "Created pivot table on Sales Pivot!A1."
+        }
+      }
+    });
+
+    expectRouteError(
+      response,
+      409,
+      "INVALID_APPROVAL",
+      "This approval is no longer valid for the current update."
     );
   });
 
@@ -1356,6 +1422,7 @@ describe("writeback confirmation flow", () => {
       body: {
         requestId: "req_pivot_history_001",
         runId: "run_pivot_history_001",
+        workbookSessionKey: "excel_windows::workbook-123",
         approvalToken: (approval.body as any).approvalToken,
         planDigest: (approval.body as any).planDigest,
         result: {
@@ -1420,6 +1487,7 @@ describe("writeback confirmation flow", () => {
       body: {
         requestId: "req_sheet_write_history_001",
         runId: "run_sheet_write_history_001",
+        workbookSessionKey: "excel_windows::workbook-123",
         approvalToken: (approval.body as any).approvalToken,
         planDigest: (approval.body as any).planDigest,
         result: buildRangeWriteResult(plan)
@@ -1478,6 +1546,7 @@ describe("writeback confirmation flow", () => {
       body: {
         requestId: "req_sheet_write_history_002",
         runId: "run_sheet_write_history_002",
+        workbookSessionKey: "excel_windows::workbook-123",
         approvalToken: (approval.body as any).approvalToken,
         planDigest: (approval.body as any).planDigest,
         result: buildRangeWriteResult(plan, { undoReady: true })
@@ -1580,6 +1649,7 @@ describe("writeback confirmation flow", () => {
       body: {
         requestId: "req_composite_dupe",
         runId: "run_composite_dupe",
+        workbookSessionKey: "excel_windows::workbook-123",
         approvalToken: (approval.body as any).approvalToken,
         planDigest: (approval.body as any).planDigest,
         result: {
@@ -1698,6 +1768,7 @@ describe("writeback confirmation flow", () => {
       body: {
         requestId: "req_composite_status_violation",
         runId: "run_composite_status_violation",
+        workbookSessionKey: "excel_windows::workbook-123",
         approvalToken: (approval.body as any).approvalToken,
         planDigest: (approval.body as any).planDigest,
         result: {
@@ -1816,6 +1887,7 @@ describe("writeback confirmation flow", () => {
       body: {
         requestId: "req_composite_partial_failure",
         runId: "run_composite_partial_failure",
+        workbookSessionKey: "excel_windows::workbook-123",
         approvalToken: (approval.body as any).approvalToken,
         planDigest: (approval.body as any).planDigest,
         result: {
@@ -1947,6 +2019,7 @@ describe("writeback confirmation flow", () => {
       body: {
         requestId: "req_composite_success_no_undo",
         runId: "run_composite_success_no_undo",
+        workbookSessionKey: "excel_windows::workbook-123",
         approvalToken: (approval.body as any).approvalToken,
         planDigest: (approval.body as any).planDigest,
         result: {
@@ -3592,6 +3665,7 @@ describe("writeback confirmation flow", () => {
         body: {
           requestId: "req_conditional_format_superseded_token",
           runId: "run_conditional_format_superseded_token",
+          workbookSessionKey: "google_sheets::sheet-123",
           approvalToken: firstApprovedBody.approvalToken,
           planDigest: firstApprovedBody.planDigest,
           result: {

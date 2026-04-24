@@ -443,6 +443,7 @@ const CompositeWritebackResultSchema = CompositeUpdateDataSchema.extend({
 const CompletionRequestSchema = z.object({
   requestId: z.string().min(1),
   runId: z.string().min(1),
+  workbookSessionKey: z.string().min(1).max(256).optional(),
   approvalToken: z.string().min(1),
   planDigest: z.string().min(1),
   result: z.union([
@@ -619,6 +620,7 @@ function formatWritebackRouteError(error: unknown): {
   if (
     message === "Approval token already consumed." ||
     message === "Approval token does not match the current writeback approval." ||
+    message === "Writeback completion does not match the approved workbook session." ||
     message === "Invalid approval token."
   ) {
     return {
@@ -1610,6 +1612,7 @@ export function approveWriteback(input: {
 export function completeWriteback(input: {
   requestId: string;
   runId: string;
+  workbookSessionKey?: string;
   approvalToken: string;
   planDigest: string;
   result: CompletionResult;
@@ -1650,6 +1653,11 @@ export function completeWriteback(input: {
   const writeback = run.writeback;
   if (!writeback) {
     throw new Error("Writeback approval not found.");
+  }
+  const completionWorkbookSessionKey = input.workbookSessionKey ?? `run::${input.runId}`;
+
+  if (writeback.workbookSessionKey !== completionWorkbookSessionKey) {
+    throw new Error("Writeback completion does not match the approved workbook session.");
   }
 
   if (writeback.completedAt) {
@@ -1760,6 +1768,7 @@ export function createWritebackRouter(input: {
       const completed = completeWriteback({
         requestId: parsed.data.requestId,
         runId: parsed.data.runId,
+        workbookSessionKey: parsed.data.workbookSessionKey,
         approvalToken: parsed.data.approvalToken,
         planDigest: parsed.data.planDigest,
         result: parsed.data.result,

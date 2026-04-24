@@ -11,6 +11,7 @@ afterEach(() => {
   delete process.env.HERMES_AGENT_API_KEY;
   delete process.env.HERMES_AGENT_MODEL;
   delete process.env.HERMES_AGENT_ID;
+  delete process.env.HERMES_AGENT_TIMEOUT_MS;
   delete process.env.HERMES_BASE_URL;
 });
 
@@ -46,6 +47,20 @@ describe("gateway config", () => {
   it("defaults the Hermes Agent API base url to the local API server path", () => {
     expect(getConfig()).toMatchObject({
       hermesAgentBaseUrl: "http://127.0.0.1:8642/v1"
+    });
+  });
+
+  it("defaults the Hermes Agent timeout to 45 seconds", () => {
+    expect(getConfig()).toMatchObject({
+      hermesAgentTimeoutMs: 45_000
+    });
+  });
+
+  it("accepts an explicit Hermes Agent timeout override", () => {
+    process.env.HERMES_AGENT_TIMEOUT_MS = "120000";
+
+    expect(getConfig()).toMatchObject({
+      hermesAgentTimeoutMs: 120_000
     });
   });
 

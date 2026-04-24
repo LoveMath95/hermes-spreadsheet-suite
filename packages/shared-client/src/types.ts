@@ -235,6 +235,7 @@ export type WritebackApprovalRequest = {
 export type WritebackCompletionRequest = {
   requestId: string;
   runId: string;
+  workbookSessionKey?: string;
   approvalToken: string;
   planDigest: string;
   result: WritebackResult;

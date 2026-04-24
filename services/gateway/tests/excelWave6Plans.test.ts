@@ -413,6 +413,30 @@ describe("Excel wave 6 composite plans and execution controls", () => {
     expect(request.source.sessionId).toMatch(/^sess_/);
   });
 
+  it("uses the persisted localStorage gateway override when no query-string gateway is present", async () => {
+    const fetchMock = vi.fn(async () => new Response(JSON.stringify({ ok: true }), {
+      status: 200,
+      headers: { "content-type": "application/json" }
+    }));
+    const taskpane = await loadTaskpaneModule({
+      sync: vi.fn(async () => {})
+    }, {
+      fetchImpl: fetchMock,
+      localStorageSeed: {
+        hermesGatewayBaseUrl: "http://gateway-from-storage.test"
+      }
+    });
+
+    await taskpane.listExecutionHistory({
+      workbookSessionKey: "excel_windows::workbook-123",
+      limit: 5
+    });
+
+    expect(String(fetchMock.mock.calls[0][0])).toContain(
+      "http://gateway-from-storage.test/api/execution/history?workbookSessionKey="
+    );
+  });
+
   it("routes natural-language undo prompts to execution control instead of sending them through the model", async () => {
     const workbookSessionId = "workbook-123";
     const workbookSessionKey = `excel_windows::${workbookSessionId}`;
@@ -655,6 +679,7 @@ describe("Excel wave 6 composite plans and execution controls", () => {
     expect(message.pendingCompletion).toMatchObject({
       requestId: "req_confirm_retry_001",
       runId: "run_confirm_retry_001",
+      workbookSessionKey: expect.stringMatching(/^excel_windows::/),
       approvalToken: "approval-token",
       planDigest: "plan-digest"
     });

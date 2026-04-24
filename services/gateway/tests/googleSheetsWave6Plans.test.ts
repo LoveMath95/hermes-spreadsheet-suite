@@ -2972,6 +2972,7 @@ describe("Google Sheets wave 6 composite plans and execution controls", () => {
     expect(hooks.state.messages[0].pendingCompletion).toMatchObject({
       requestId: "req_confirm_retry_001",
       runId: "run_confirm_retry_001",
+      workbookSessionKey: "google_sheets::sheet-123",
       approvalToken: "approval-token",
       planDigest: "plan-digest"
     });

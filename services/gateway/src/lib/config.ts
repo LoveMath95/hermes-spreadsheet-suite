@@ -19,6 +19,7 @@ export type GatewayConfig = {
   hermesAgentBaseUrl?: string;
   hermesAgentApiKey?: string;
   hermesAgentModel?: string;
+  hermesAgentTimeoutMs?: number;
   skillRegistryPath: string;
 };
 
@@ -28,6 +29,7 @@ const LOCAL_GATEWAY_DEFAULT_ALLOWED_ORIGINS = [
   "https://localhost:3000",
   "https://127.0.0.1:3000"
 ] as const;
+const DEFAULT_HERMES_AGENT_TIMEOUT_MS = 45_000;
 
 function isLoopbackBaseUrl(value: string): boolean {
   try {
@@ -40,6 +42,11 @@ function isLoopbackBaseUrl(value: string): boolean {
 
 function parseBooleanEnv(value: string | undefined): boolean {
   return value === "true" || value === "1";
+}
+
+function parsePositiveIntegerEnv(value: string | undefined, fallback: number): number {
+  const parsed = Number.parseInt(String(value ?? ""), 10);
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : fallback;
 }
 
 function tryNormalizeOrigin(value: string): string | undefined {
@@ -108,6 +115,10 @@ export function getConfig(): GatewayConfig {
       "http://127.0.0.1:8642/v1",
     hermesAgentApiKey: process.env.HERMES_API_SERVER_KEY ?? process.env.HERMES_AGENT_API_KEY,
     hermesAgentModel: process.env.HERMES_AGENT_MODEL ?? process.env.HERMES_AGENT_ID,
+    hermesAgentTimeoutMs: parsePositiveIntegerEnv(
+      process.env.HERMES_AGENT_TIMEOUT_MS,
+      DEFAULT_HERMES_AGENT_TIMEOUT_MS
+    ),
     skillRegistryPath: process.env.SKILL_REGISTRY_PATH ??
       "../../extensions/registry/skill-registry.json"
   };

@@ -50,6 +50,14 @@ type ContractSafeErrorCode =
 const INVALID_HERMES_DEBUG_PREFIX = path.join(tmpdir(), "hermes-spreadsheet-invalid");
 const INTERNAL_ERROR_LANGUAGE_PATTERN = /\b(contract|schema|structured body|validation|json|payload|parse|parser|normaliz(?:e|ation))\b/i;
 const MAX_GATEWAY_RESPONSE_TRACE_EVENTS = 200;
+const DEFAULT_HERMES_AGENT_TIMEOUT_MS = 45_000;
+
+class HermesProviderTimeoutError extends Error {
+  constructor(timeoutMs: number) {
+    super(`Hermes provider request timed out after ${timeoutMs}ms.`);
+    this.name = "HermesProviderTimeoutError";
+  }
+}
 
 function isObject(value: unknown): value is JsonRecord {
   return typeof value === "object" && value !== null;
@@ -347,11 +355,55 @@ export class HermesAgentClient {
   private async fetchHermesAgentResponse(input: ProcessRequestInput): Promise<HermesResponse> {
     const startedAt = this.getRunStartedAt(input);
     const endpoint = this.resolveEndpoint();
-    const httpResponse = await fetch(endpoint, {
-      method: "POST",
-      headers: this.buildHeaders(),
-      body: JSON.stringify(this.buildChatCompletionsBody(input.request))
-    });
+    const timeoutMs = this.config.hermesAgentTimeoutMs ?? DEFAULT_HERMES_AGENT_TIMEOUT_MS;
+    const controller = typeof AbortController === "function"
+      ? new AbortController()
+      : undefined;
+    let timeoutHandle: ReturnType<typeof globalThis.setTimeout> | undefined;
+    let httpResponse: Response;
+
+    try {
+      httpResponse = await Promise.race([
+        fetch(endpoint, {
+          method: "POST",
+          headers: this.buildHeaders(),
+          body: JSON.stringify(this.buildChatCompletionsBody(input.request)),
+          ...(controller ? { signal: controller.signal } : {})
+        }),
+        new Promise<Response>((_resolve, reject) => {
+          timeoutHandle = globalThis.setTimeout(() => {
+            controller?.abort();
+            reject(new HermesProviderTimeoutError(timeoutMs));
+          }, timeoutMs);
+        })
+      ]);
+    } catch (error) {
+      if (error instanceof HermesProviderTimeoutError) {
+        return this.makeGatewayErrorResponse({
+          request: input.request,
+          runId: input.runId,
+          traceBus: input.traceBus,
+          startedAt,
+          code: "TIMEOUT",
+          message: `The Hermes service did not respond before the ${Math.ceil(timeoutMs / 1000)} second timeout.`,
+          retryable: true,
+          userAction: "Retry the request. If it keeps timing out, reduce the scope or check that the Hermes service is healthy.",
+          trace: [
+            ...input.traceBus.list(input.runId, 0),
+            {
+              event: "failed",
+              timestamp: this.nowIso(input.traceBus)
+            }
+          ]
+        });
+      }
+
+      throw error;
+    } finally {
+      if (timeoutHandle) {
+        globalThis.clearTimeout(timeoutHandle);
+      }
+    }
 
     let payload: unknown;
     const contentType = httpResponse.headers.get("content-type") ?? "";

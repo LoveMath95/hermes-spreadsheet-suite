@@ -21,6 +21,7 @@ afterEach(() => {
   delete process.env.HERMES_AGENT_API_KEY;
   delete process.env.HERMES_AGENT_MODEL;
   delete process.env.HERMES_AGENT_ID;
+  delete process.env.HERMES_AGENT_TIMEOUT_MS;
   delete process.env.HERMES_BASE_URL;
   delete process.env.HERMES_SERVICE_LABEL;
   delete process.env.HERMES_ENVIRONMENT_LABEL;
@@ -2913,6 +2914,44 @@ describe("HermesAgentClient", () => {
     expect(response?.type).not.toBe("sheet_import_plan");
     expect(response?.type).not.toBe("extracted_table");
     expect(response?.data.code).not.toBe("INTERNAL_ERROR");
+  });
+
+  it("returns a terminal TIMEOUT error when the Hermes provider does not answer before the deadline", async () => {
+    vi.useFakeTimers();
+    process.env.HERMES_AGENT_BASE_URL = "http://hermes.test/v1";
+    process.env.HERMES_AGENT_TIMEOUT_MS = "25";
+    const client = new HermesAgentClient(getConfig());
+    const traceBus = new TraceBus();
+
+    vi.stubGlobal("fetch", vi.fn(async (_url: string, init?: RequestInit) => (
+      await new Promise<Response>((_resolve, reject) => {
+        const signal = init?.signal;
+        if (signal && typeof signal.addEventListener === "function") {
+          signal.addEventListener("abort", () => reject(new Error("aborted")), { once: true });
+        }
+      })
+    )));
+
+    const requestPromise = client.processRequest({
+      runId: "run_timeout_001",
+      request: baseRequest({
+        requestId: "req_timeout_001"
+      }),
+      traceBus
+    });
+
+    await vi.advanceTimersByTimeAsync(25);
+    await requestPromise;
+
+    const response = traceBus.getRun("run_timeout_001")?.response;
+    expect(response?.type).toBe("error");
+    expect(response?.data).toMatchObject({
+      code: "TIMEOUT",
+      retryable: true
+    });
+    expect(response?.trace.at(-1)).toMatchObject({
+      event: "failed"
+    });
   });
 
   it("uses the injected TraceBus clock for response timestamps", async () => {
