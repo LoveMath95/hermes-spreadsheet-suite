@@ -1,0 +1,155 @@
+import fs from "node:fs/promises";
+import os from "node:os";
+import path from "node:path";
+
+import { afterEach, describe, expect, it } from "vitest";
+
+import {
+  createBoundGoogleSheetsScriptProject,
+  GOOGLE_SHEETS_ADDON_SOURCE_FILES,
+  GOOGLE_SHEETS_ADDON_STAGE_FILES,
+  GOOGLE_SHEETS_DEPLOYMENT_CONFIG_PATH,
+  buildGoogleSheetsDeploymentConfigSource,
+  buildClaspConfig,
+  extractGoogleSpreadsheetId,
+  isAppsScriptReachableGatewayBaseUrl,
+  refreshClaspAccessToken,
+  stageGoogleSheetsAddonProject
+} from "../src/lib/googleSheetsAddonDeploy";
+
+const REPO_ROOT = path.resolve(__dirname, "../../..");
+const tempDirs: string[] = [];
+
+afterEach(async () => {
+  await Promise.all(
+    tempDirs.splice(0).map((dir) => fs.rm(dir, { recursive: true, force: true }))
+  );
+});
+
+describe("Google Sheets add-on deploy helpers", () => {
+  it("extracts the spreadsheet id from both raw ids and full Google Sheets URLs", () => {
+    expect(extractGoogleSpreadsheetId("1Smz8ctI5gpahOuAP-p0l8VTE7oGeppnMsSVnzVU1YmA")).toBe(
+      "1Smz8ctI5gpahOuAP-p0l8VTE7oGeppnMsSVnzVU1YmA"
+    );
+    expect(
+      extractGoogleSpreadsheetId(
+        "https://docs.google.com/spreadsheets/d/1Smz8ctI5gpahOuAP-p0l8VTE7oGeppnMsSVnzVU1YmA/edit#gid=0"
+      )
+    ).toBe("1Smz8ctI5gpahOuAP-p0l8VTE7oGeppnMsSVnzVU1YmA");
+  });
+
+  it("rejects malformed spreadsheet inputs", () => {
+    expect(() => extractGoogleSpreadsheetId("")).toThrow("required");
+    expect(() => extractGoogleSpreadsheetId("not a spreadsheet url")).toThrow(
+      "Could not extract"
+    );
+  });
+
+  it("accepts public gateway hosts and rejects localhost or private-network ones", () => {
+    expect(isAppsScriptReachableGatewayBaseUrl("https://gateway.example.com")).toBe(true);
+    expect(isAppsScriptReachableGatewayBaseUrl("https://[2606:4700::1111]")).toBe(true);
+    expect(isAppsScriptReachableGatewayBaseUrl("http://gateway.example.com")).toBe(false);
+    expect(isAppsScriptReachableGatewayBaseUrl("http://localhost:8787")).toBe(false);
+    expect(isAppsScriptReachableGatewayBaseUrl("http://127.0.0.1:8787")).toBe(false);
+    expect(isAppsScriptReachableGatewayBaseUrl("http://192.168.1.10:8787")).toBe(false);
+    expect(isAppsScriptReachableGatewayBaseUrl("https://[::1]:8787")).toBe(false);
+    expect(isAppsScriptReachableGatewayBaseUrl("https://[fc00::1]:8787")).toBe(false);
+    expect(isAppsScriptReachableGatewayBaseUrl("https://[fe80::1]:8787")).toBe(false);
+    expect(isAppsScriptReachableGatewayBaseUrl("https://[::ffff:127.0.0.1]:8787")).toBe(false);
+  });
+
+  it("builds a deployment config source file with the requested overrides", () => {
+    const source = buildGoogleSheetsDeploymentConfigSource({
+      gatewayBaseUrl: "https://gateway.example.com",
+      clientVersion: "google-sheets-addon-live-demo",
+      reviewerSafeMode: true,
+      forceExtractionMode: "demo"
+    });
+
+    expect(source).toContain("function getHermesDeploymentOverrides()");
+    expect(source).toContain('"gatewayBaseUrl": "https://gateway.example.com"');
+    expect(source).toContain('"clientVersion": "google-sheets-addon-live-demo"');
+    expect(source).toContain('"reviewerSafeMode": true');
+    expect(source).toContain('"forceExtractionMode": "demo"');
+  });
+
+  it("refreshes the clasp access token from the stored OAuth credentials", async () => {
+    const fetchMock = async () =>
+      ({
+        ok: true,
+        json: async () => ({ access_token: "access_123" })
+      }) as Response;
+
+    await expect(
+      refreshClaspAccessToken(
+        {
+          client_id: "client_123",
+          client_secret: "secret_123",
+          refresh_token: "refresh_123"
+        },
+        fetchMock
+      )
+    ).resolves.toBe("access_123");
+  });
+
+  it("creates a bound Apps Script project for the target spreadsheet through the official API", async () => {
+    const fetchMock = async (url: string, init?: RequestInit) => {
+      expect(url).toBe("https://script.googleapis.com/v1/projects");
+      expect(init?.method).toBe("POST");
+      expect(init?.headers).toMatchObject({
+        authorization: "Bearer access_123"
+      });
+      expect(JSON.parse(String(init?.body))).toEqual({
+        title: "Hermes Agent",
+        parentId: "1Smz8ctI5gpahOuAP-p0l8VTE7oGeppnMsSVnzVU1YmA"
+      });
+      return {
+        ok: true,
+        json: async () => ({ scriptId: "script_123" })
+      } as Response;
+    };
+
+    await expect(
+      createBoundGoogleSheetsScriptProject({
+        accessToken: "access_123",
+        spreadsheetId:
+          "https://docs.google.com/spreadsheets/d/1Smz8ctI5gpahOuAP-p0l8VTE7oGeppnMsSVnzVU1YmA/edit#gid=0",
+        title: "Hermes Agent",
+        fetchImpl: fetchMock
+      })
+    ).resolves.toEqual({ scriptId: "script_123" });
+  });
+
+  it("stages the add-on project with repo files, generated deployment config, and clasp config", async () => {
+    const stageDir = await fs.mkdtemp(path.join(os.tmpdir(), "hermes-gs-addon-test-"));
+    tempDirs.push(stageDir);
+
+    const writtenFiles = await stageGoogleSheetsAddonProject({
+      repoRoot: REPO_ROOT,
+      stageDir,
+      scriptId: "script_123",
+      deployment: {
+        gatewayBaseUrl: "https://gateway.example.com"
+      }
+    });
+
+    for (const file of GOOGLE_SHEETS_ADDON_STAGE_FILES) {
+      await expect(fs.readFile(path.join(stageDir, file.targetPath), "utf8")).resolves.toBeTruthy();
+    }
+
+    await expect(
+      fs.readFile(path.join(stageDir, GOOGLE_SHEETS_DEPLOYMENT_CONFIG_PATH), "utf8")
+    ).resolves.toContain("https://gateway.example.com");
+
+    expect(await fs.readFile(path.join(stageDir, ".clasp.json"), "utf8")).toBe(
+      buildClaspConfig("script_123")
+    );
+    expect(writtenFiles).toContain(".clasp.json");
+    expect(writtenFiles).toContain(GOOGLE_SHEETS_DEPLOYMENT_CONFIG_PATH);
+    expect(writtenFiles).toContain("appsscript.json");
+    expect(writtenFiles).toContain("src/Code.gs");
+    expect(writtenFiles).toContain("html/Sidebar.html");
+    expect(writtenFiles).not.toContain(GOOGLE_SHEETS_ADDON_SOURCE_FILES[0]);
+    expect(writtenFiles.every((file) => !file.includes("\\"))).toBe(true);
+  });
+});

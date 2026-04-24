@@ -1,0 +1,870 @@
+import { describe, expect, it } from "vitest";
+import {
+  extractSingleJsonObjectText,
+  HermesStructuredBodySchema,
+  normalizeHermesStructuredBodyInput
+} from "../src/hermes/structuredBody.ts";
+
+describe("structured body normalization", () => {
+  it.each([
+    [
+      "chat",
+      {
+        type: "chat",
+        data: {
+          message: "The selection is a revenue table.",
+          confidence: 0.93,
+          followUpSuggestions: ["Summarize revenue by region"],
+          selection: { sheet: "Sheet1", range: "A1:F6" },
+          highlights: ["Revenue is present in column F"]
+        },
+        warnings: ["Partial selection payload."],
+        skillsUsed: ["spreadsheet-expert"],
+        requestId: "drop-me"
+      },
+      {
+        type: "chat",
+        data: {
+          message: "The selection is a revenue table.",
+          confidence: 0.93,
+          followUpSuggestions: ["Summarize revenue by region"]
+        },
+        warnings: [
+          {
+            code: "MODEL_WARNING",
+            message: "Partial selection payload.",
+            severity: "warning"
+          }
+        ],
+        skillsUsed: ["spreadsheet-expert"]
+      }
+    ],
+    [
+      "formula",
+      {
+        type: "formula",
+        data: {
+          intent: "suggest",
+          targetCell: "F12",
+          formula: "=SUMIFS(F2:F11, D2:D11, \"North\")",
+          formulaLanguage: "google_sheets",
+          explanation: "This sums revenue for the North region.",
+          alternateFormulas: [
+            {
+              formula: "=SUM(FILTER(F2:F11, D2:D11=\"North\"))",
+              explanation: "Alternative formulation.",
+              note: "drop-me"
+            }
+          ],
+          confidence: 0.95,
+          requiresConfirmation: true,
+          highlights: ["drop-me"]
+        },
+        downstreamProvider: "openai"
+      },
+      {
+        type: "formula",
+        data: {
+          intent: "suggest",
+          targetCell: "F12",
+          formula: "=SUMIFS(F2:F11, D2:D11, \"North\")",
+          formulaLanguage: "google_sheets",
+          explanation: "This sums revenue for the North region.",
+          alternateFormulas: [
+            {
+              formula: "=SUM(FILTER(F2:F11, D2:D11=\"North\"))",
+              explanation: "Alternative formulation."
+            }
+          ],
+          confidence: 0.95,
+          requiresConfirmation: true
+        },
+        downstreamProvider: {
+          label: "openai"
+        }
+      }
+    ],
+    [
+      "sheet_update",
+      {
+        type: "sheet_update",
+        data: {
+          targetSheet: "Sheet1",
+          targetRange: "F12",
+          operation: "set_formulas",
+          formulas: [["=SUMIFS(F2:F11, D2:D11, \"North\")"]],
+          explanation: "Set the North revenue formula.",
+          confidence: 0.97,
+          requiresConfirmation: true,
+          overwriteRisk: "low",
+          shape: { rows: 1, columns: 1, previewRows: 1 },
+          preview: { anchor: "F12" }
+        },
+        skillsUsed: ["sheet-writer"],
+        debug: true
+      },
+      {
+        type: "sheet_update",
+        data: {
+          targetSheet: "Sheet1",
+          targetRange: "F12",
+          operation: "set_formulas",
+          formulas: [["=SUMIFS(F2:F11, D2:D11, \"North\")"]],
+          explanation: "Set the North revenue formula.",
+          confidence: 0.97,
+          requiresConfirmation: true,
+          overwriteRisk: "low",
+          shape: { rows: 1, columns: 1 }
+        },
+        skillsUsed: ["sheet-writer"]
+      }
+    ],
+    [
+      "sheet_import_plan",
+      {
+        type: "sheet_import_plan",
+        data: {
+          sourceAttachmentId: "att_100",
+          targetSheet: "Imported Table",
+          targetRange: "A1:B2",
+          headers: ["Date", "Amount"],
+          values: [["2026-04-01", 15.5]],
+          confidence: 0.89,
+          warnings: ["OCR confidence is moderate."],
+          requiresConfirmation: true,
+          extractionMode: "real",
+          shape: { rows: 2, columns: 2, preview: true },
+          previewRows: 5
+        },
+        extra: "drop-me"
+      },
+      {
+        type: "sheet_import_plan",
+        data: {
+          sourceAttachmentId: "att_100",
+          targetSheet: "Imported Table",
+          targetRange: "A1:B2",
+          headers: ["Date", "Amount"],
+          values: [["2026-04-01", 15.5]],
+          confidence: 0.89,
+          warnings: [
+            {
+              code: "MODEL_WARNING",
+              message: "OCR confidence is moderate.",
+              severity: "warning"
+            }
+          ],
+          requiresConfirmation: true,
+          extractionMode: "real",
+          shape: { rows: 2, columns: 2 }
+        }
+      }
+    ],
+    [
+      "external_data_plan",
+      {
+        type: "external_data_plan",
+        data: {
+          sourceType: "market_data",
+          provider: "googlefinance",
+          query: {
+            symbol: "NASDAQ:GOOG",
+            attribute: "price",
+            dropMe: true
+          },
+          targetSheet: "Market Data",
+          targetRange: "B2",
+          formula: '=GOOGLEFINANCE("NASDAQ:GOOG","price")',
+          explanation: "Anchor the latest GOOG price in B2.",
+          confidence: 0.92,
+          requiresConfirmation: true,
+          overwriteRisk: "Anchors a live formula in B2."
+        },
+        extra: "drop-me"
+      },
+      {
+        type: "external_data_plan",
+        data: {
+          sourceType: "market_data",
+          provider: "googlefinance",
+          query: {
+            symbol: "NASDAQ:GOOG",
+            attribute: "price"
+          },
+          targetSheet: "Market Data",
+          targetRange: "B2",
+          formula: '=GOOGLEFINANCE("NASDAQ:GOOG","price")',
+          explanation: "Anchor the latest GOOG price in B2.",
+          confidence: 0.92,
+          requiresConfirmation: true,
+          affectedRanges: ["Market Data!B2"],
+          overwriteRisk: "low",
+          confirmationLevel: "standard"
+        }
+      }
+    ],
+    [
+      "error",
+      {
+        type: "error",
+        data: {
+          code: "INTERNAL_ERROR",
+          message: "Something failed.",
+          retryable: true,
+          userAction: "Retry later.",
+          details: "drop-me"
+        },
+        warnings: [
+          {
+            code: "SAFE",
+            message: "Already structured.",
+            severity: "warning"
+          }
+        ],
+        metadata: {}
+      },
+      {
+        type: "error",
+        data: {
+          code: "INTERNAL_ERROR",
+          message: "Something failed.",
+          retryable: true,
+          userAction: "Retry later."
+        },
+        warnings: [
+          {
+            code: "SAFE",
+            message: "Already structured.",
+            severity: "warning"
+          }
+        ]
+      }
+    ],
+    [
+      "attachment_analysis",
+      {
+        type: "attachment_analysis",
+        data: {
+          sourceAttachmentId: "att_101",
+          contentKind: "table",
+          summary: "The image contains a small pricing table.",
+          confidence: 0.8,
+          warnings: ["The image is slightly blurred."],
+          extractionMode: "real",
+          blocks: []
+        }
+      },
+      {
+        type: "attachment_analysis",
+        data: {
+          sourceAttachmentId: "att_101",
+          contentKind: "table",
+          summary: "The image contains a small pricing table.",
+          confidence: 0.8,
+          warnings: [
+            {
+              code: "MODEL_WARNING",
+              message: "The image is slightly blurred.",
+              severity: "warning"
+            }
+          ],
+          extractionMode: "real"
+        }
+      }
+    ],
+    [
+      "extracted_table",
+      {
+        type: "extracted_table",
+        data: {
+          sourceAttachmentId: "att_102",
+          headers: ["Item"],
+          rows: [["Cable"]],
+          confidence: 0.86,
+          warnings: ["Column alignment may be approximate."],
+          extractionMode: "real",
+          shape: { rows: 1, columns: 1, preview: false },
+          highlights: ["drop-me"]
+        }
+      },
+      {
+        type: "extracted_table",
+        data: {
+          sourceAttachmentId: "att_102",
+          headers: ["Item"],
+          rows: [["Cable"]],
+          confidence: 0.86,
+          warnings: [
+            {
+              code: "MODEL_WARNING",
+              message: "Column alignment may be approximate.",
+              severity: "warning"
+            }
+          ],
+          extractionMode: "real",
+          shape: { rows: 1, columns: 1 }
+        }
+      }
+    ],
+    [
+      "document_summary",
+      {
+        type: "document_summary",
+        data: {
+          sourceAttachmentId: "att_103",
+          summary: "The attachment describes quarterly revenue results.",
+          contentKind: "plain_text",
+          keyPoints: ["Revenue increased quarter over quarter."],
+          confidence: 0.91,
+          warnings: ["Only the first page was fully legible."],
+          extractionMode: "real",
+          sections: []
+        }
+      },
+      {
+        type: "document_summary",
+        data: {
+          sourceAttachmentId: "att_103",
+          summary: "The attachment describes quarterly revenue results.",
+          contentKind: "plain_text",
+          keyPoints: ["Revenue increased quarter over quarter."],
+          confidence: 0.91,
+          warnings: [
+            {
+              code: "MODEL_WARNING",
+              message: "Only the first page was fully legible.",
+              severity: "warning"
+            }
+          ],
+          extractionMode: "real"
+        }
+      }
+    ]
+  ])("normalizes %s bodies with extra unsupported keys before validation", (
+    _label,
+    rawBody,
+    expectedBody
+  ) => {
+    const normalized = normalizeHermesStructuredBodyInput(rawBody);
+    const parsed = HermesStructuredBodySchema.parse(normalized);
+
+    expect(parsed).toEqual(expectedBody);
+  });
+
+  it("normalizes chart legendPosition none to the contract-safe hidden alias", () => {
+    const normalized = normalizeHermesStructuredBodyInput({
+      type: "chart_plan",
+      data: {
+        sourceSheet: "Crypto Prices",
+        sourceRange: "A1:B11",
+        targetSheet: "Crypto Prices",
+        targetRange: "D1",
+        chartType: "column",
+        categoryField: "Asset",
+        series: [{ field: "Price (USD)", label: "Price (USD)" }],
+        legendPosition: "none",
+        explanation: "Compare prices by asset.",
+        confidence: 0.92,
+        requiresConfirmation: true,
+        affectedRanges: ["Crypto Prices!A1:B11", "Crypto Prices!D1"],
+        overwriteRisk: "low",
+        confirmationLevel: "standard"
+      }
+    });
+
+    expect(normalized).toEqual({
+      type: "chart_plan",
+      data: {
+        sourceSheet: "Crypto Prices",
+        sourceRange: "A1:B11",
+        targetSheet: "Crypto Prices",
+        targetRange: "D1",
+        chartType: "column",
+        categoryField: "Asset",
+        series: [{ field: "Price (USD)", label: "Price (USD)" }],
+        legendPosition: "hidden",
+        explanation: "Compare prices by asset.",
+        confidence: 0.92,
+        requiresConfirmation: true,
+        affectedRanges: ["Crypto Prices!A1:B11", "Crypto Prices!D1"],
+        overwriteRisk: "low",
+        confirmationLevel: "standard"
+      }
+    });
+
+    expect(() => HermesStructuredBodySchema.parse(normalized)).not.toThrow();
+  });
+
+  it("coerces formula alternateFormulas string entries into contract-valid objects", () => {
+    const rawBody = {
+      type: "formula",
+      data: {
+        intent: "suggest",
+        formula: "=SUMIF(B2:B7,B8,F2:F7)",
+        formulaLanguage: "google_sheets",
+        explanation: "Sum matching values for the category in B8.",
+        alternateFormulas: [
+          "=SUMIFS(F2:F7,B2:B7,B8)",
+          "=SUMIF($B$2:$B$7,B8,$F$2:$F$7)"
+        ],
+        confidence: 0.74
+      }
+    };
+
+    const normalized = normalizeHermesStructuredBodyInput(rawBody);
+    const parsed = HermesStructuredBodySchema.parse(normalized);
+
+    expect(parsed).toEqual({
+      type: "formula",
+      data: {
+        intent: "suggest",
+        formula: "=SUMIF(B2:B7,B8,F2:F7)",
+        formulaLanguage: "google_sheets",
+        explanation: "Sum matching values for the category in B8.",
+        alternateFormulas: [
+          {
+            formula: "=SUMIFS(F2:F7,B2:B7,B8)",
+            explanation: "Alternative formulation."
+          },
+          {
+            formula: "=SUMIF($B$2:$B$7,B8,$F$2:$F$7)",
+            explanation: "Alternative formulation."
+          }
+        ],
+        confidence: 0.74
+      }
+    });
+  });
+
+  it("maps model-specific missing-context errors into contract-safe spreadsheet context errors", () => {
+    const rawBody = {
+      type: "error",
+      data: {
+        code: "MISSING_REQUIRED_CONTEXT",
+        message: "Tell me which cell and condition to use.",
+        retryable: true,
+        userAction: "Specify the target cell and the SUMIF condition."
+      }
+    };
+
+    const normalized = normalizeHermesStructuredBodyInput(rawBody);
+    const parsed = HermesStructuredBodySchema.parse(normalized);
+
+    expect(parsed).toEqual({
+      type: "error",
+      data: {
+        code: "SPREADSHEET_CONTEXT_MISSING",
+        message: "Tell me which cell and condition to use.",
+        retryable: true,
+        userAction: "Specify the target cell and the SUMIF condition."
+      }
+    });
+  });
+
+  it("maps descriptive overwriteRisk text into a contract-safe risk level for sheet updates", () => {
+    const rawBody = {
+      type: "sheet_update",
+      data: {
+        targetSheet: "Sheet1",
+        targetRange: "H11",
+        operation: "set_formulas",
+        formulas: [["=SUMIF(B:B,\"north\",F:F)"]],
+        explanation: "Write the corrected formula into H11.",
+        confidence: 0.93,
+        requiresConfirmation: true,
+        shape: { rows: 1, columns: 1 },
+        overwriteRisk: "Replaces the existing formula in H11."
+      }
+    };
+
+    const normalized = normalizeHermesStructuredBodyInput(rawBody);
+    const parsed = HermesStructuredBodySchema.parse(normalized);
+
+    expect(parsed).toEqual({
+      type: "sheet_update",
+      data: {
+        targetSheet: "Sheet1",
+        targetRange: "H11",
+        operation: "set_formulas",
+        formulas: [["=SUMIF(B:B,\"north\",F:F)"]],
+        explanation: "Write the corrected formula into H11.",
+        confidence: 0.93,
+        requiresConfirmation: true,
+        shape: { rows: 1, columns: 1 },
+        overwriteRisk: "low"
+      }
+    });
+  });
+
+  it("normalizes composite_plan bodies with nested executable steps before validation", () => {
+    const rawBody = {
+      type: "composite_plan",
+      data: {
+        steps: [
+          {
+            stepId: "step_sort",
+            dependsOn: [],
+            continueOnError: false,
+            plan: {
+              targetSheet: "Sales",
+              targetRange: "A1:F50",
+              hasHeader: true,
+              keys: [
+                { columnRef: "Revenue", direction: "desc", unexpected: "drop-me" }
+              ],
+              explanation: "Sort by revenue.",
+              confidence: 0.91,
+              requiresConfirmation: true,
+              affectedRanges: ["Sales!A1:F50"],
+              unexpected: "drop-me"
+            },
+            unexpected: "drop-me"
+          }
+        ],
+        explanation: "Run the workflow.",
+        confidence: 0.9,
+        requiresConfirmation: true,
+        affectedRanges: ["Sales!A1:F50"],
+        overwriteRisk: "low",
+        confirmationLevel: "standard",
+        reversible: false,
+        dryRunRecommended: true,
+        dryRunRequired: false,
+        unexpected: "drop-me"
+      },
+      extra: "drop-me"
+    };
+
+    const normalized = normalizeHermesStructuredBodyInput(rawBody);
+    const parsed = HermesStructuredBodySchema.parse(normalized);
+
+    expect(parsed).toEqual({
+      type: "composite_plan",
+      data: {
+        steps: [
+          {
+            stepId: "step_sort",
+            dependsOn: [],
+            continueOnError: false,
+            plan: {
+              targetSheet: "Sales",
+              targetRange: "A1:F50",
+              hasHeader: true,
+              keys: [
+                { columnRef: "Revenue", direction: "desc" }
+              ],
+              explanation: "Sort by revenue.",
+              confidence: 0.91,
+              requiresConfirmation: true,
+              affectedRanges: ["Sales!A1:F50"]
+            }
+          }
+        ],
+        explanation: "Run the workflow.",
+        confidence: 0.9,
+        requiresConfirmation: true,
+        affectedRanges: ["Sales!A1:F50"],
+        overwriteRisk: "low",
+        confirmationLevel: "standard",
+        reversible: false,
+        dryRunRecommended: true,
+        dryRunRequired: false
+      }
+    });
+  });
+
+  it.each([
+    [
+      "chat missing message",
+      {
+        type: "chat",
+        data: {
+          selection: { sheet: "Sheet1" }
+        }
+      },
+      ["data", "message"]
+    ],
+    [
+      "formula missing formula",
+      {
+        type: "formula",
+        data: {
+          intent: "suggest",
+          formulaLanguage: "excel",
+          explanation: "Missing formula should fail.",
+          confidence: 0.8
+        }
+      },
+      ["data", "formula"]
+    ],
+    [
+      "sheet_update missing shape",
+      {
+        type: "sheet_update",
+        data: {
+          targetSheet: "Sheet1",
+          targetRange: "A1",
+          operation: "append_rows",
+          values: [[1]],
+          explanation: "Shape is required.",
+          confidence: 0.8,
+          requiresConfirmation: true
+        }
+      },
+      ["data", "shape"]
+    ]
+  ])("rejects %s after normalization", (_label, rawBody, expectedPath) => {
+    const normalized = normalizeHermesStructuredBodyInput(rawBody);
+    const parsed = HermesStructuredBodySchema.safeParse(normalized);
+
+    expect(parsed.success).toBe(false);
+    if (parsed.success) {
+      return;
+    }
+
+    expect(parsed.error.issues.some((issue) =>
+      JSON.stringify(issue.path) === JSON.stringify(expectedPath)
+    )).toBe(true);
+  });
+
+  it("rejects prose mixed with JSON", () => {
+    expect(extractSingleJsonObjectText(
+      "Here is the payload:\n{\"type\":\"chat\",\"data\":{\"message\":\"hello\"}}"
+    )).toBeNull();
+  });
+
+  it("preserves raw composite step families without misclassifying them as sheet structure updates", () => {
+    const normalized = normalizeHermesStructuredBodyInput({
+      type: "composite_plan",
+      data: {
+        steps: [
+          {
+            stepId: "analysis",
+            dependsOn: [],
+            continueOnError: false,
+            plan: {
+              sourceSheet: "Sales",
+              sourceRange: "A1:F50",
+              outputMode: "materialize_report",
+              targetSheet: "Report",
+              targetRange: "A1",
+              sections: [
+                {
+                  type: "summary_stats",
+                  title: "Summary",
+                  summary: "Revenue summary.",
+                  sourceRanges: ["Sales!A1:F50"]
+                }
+              ],
+              explanation: "Build a report.",
+              confidence: 0.9,
+              requiresConfirmation: true,
+              affectedRanges: ["Sales!A1:F50", "Report!A1"],
+              overwriteRisk: "low",
+              confirmationLevel: "standard"
+            }
+          },
+          {
+            stepId: "pivot",
+            dependsOn: ["analysis"],
+            continueOnError: false,
+            plan: {
+              sourceSheet: "Sales",
+              sourceRange: "A1:F50",
+              targetSheet: "Pivot",
+              targetRange: "A1",
+              rowGroups: ["Region"],
+              valueAggregations: [
+                {
+                  field: "Revenue",
+                  aggregation: "sum"
+                }
+              ],
+              explanation: "Build a pivot.",
+              confidence: 0.9,
+              requiresConfirmation: true,
+              affectedRanges: ["Sales!A1:F50", "Pivot!A1"],
+              overwriteRisk: "low",
+              confirmationLevel: "standard"
+            }
+          },
+          {
+            stepId: "chart",
+            dependsOn: ["pivot"],
+            continueOnError: false,
+            plan: {
+              sourceSheet: "Sales",
+              sourceRange: "A1:F50",
+              targetSheet: "Chart",
+              targetRange: "A1",
+              chartType: "column",
+              series: [
+                {
+                  field: "Revenue",
+                  label: "Revenue"
+                }
+              ],
+              categoryField: "Month",
+              title: "Revenue by Month",
+              explanation: "Build a chart.",
+              confidence: 0.9,
+              requiresConfirmation: true,
+              affectedRanges: ["Sales!A1:F50", "Chart!A1"],
+              overwriteRisk: "low",
+              confirmationLevel: "standard"
+            }
+          },
+          {
+            stepId: "transfer",
+            dependsOn: ["chart"],
+            continueOnError: false,
+            plan: {
+              sourceSheet: "Sales",
+              sourceRange: "A2:B10",
+              targetSheet: "Archive",
+              targetRange: "D5",
+              operation: "copy",
+              pasteMode: "values",
+              transpose: false,
+              explanation: "Copy values.",
+              confidence: 0.9,
+              requiresConfirmation: true,
+              affectedRanges: ["Sales!A2:B10", "Archive!D5:E13"],
+              overwriteRisk: "low",
+              confirmationLevel: "standard"
+            }
+          },
+          {
+            stepId: "cleanup",
+            dependsOn: ["transfer"],
+            continueOnError: false,
+            plan: {
+              targetSheet: "Archive",
+              targetRange: "D5:E13",
+              operation: "split_column",
+              sourceColumn: "D",
+              targetStartColumn: "D",
+              delimiter: "-",
+              explanation: "Split codes.",
+              confidence: 0.9,
+              requiresConfirmation: true,
+              affectedRanges: ["Archive!D5:E13"],
+              overwriteRisk: "high",
+              confirmationLevel: "destructive"
+            }
+          }
+        ],
+        explanation: "Run the workflow.",
+        confidence: 0.9,
+        requiresConfirmation: true,
+        affectedRanges: ["Sales!A1:F50", "Report!A1"],
+        overwriteRisk: "low",
+        confirmationLevel: "standard",
+        reversible: false,
+        dryRunRecommended: true,
+        dryRunRequired: false
+      }
+    });
+
+    const parsed = HermesStructuredBodySchema.parse(normalized);
+    expect(parsed.type).toBe("composite_plan");
+    expect(parsed.data.reversible).toBe(false);
+    expect(parsed.data.steps[0].plan.outputMode).toBe("materialize_report");
+    expect(parsed.data.steps[1].plan.rowGroups).toEqual(["Region"]);
+    expect(parsed.data.steps[2].plan.series[0]).toMatchObject({ field: "Revenue" });
+    expect(parsed.data.steps[3].plan.pasteMode).toBe("values");
+    expect(parsed.data.steps[4].plan.delimiter).toBe("-");
+  });
+
+  it("preserves all supported conditional-format style fields during normalization", () => {
+    const parsed = HermesStructuredBodySchema.parse(normalizeHermesStructuredBodyInput({
+      type: "conditional_format_plan",
+      data: {
+        targetSheet: "Sheet1",
+        targetRange: "B2:B20",
+        explanation: "Highlight revenue values.",
+        confidence: 0.94,
+        requiresConfirmation: true,
+        affectedRanges: ["Sheet1!B2:B20"],
+        replacesExistingRules: false,
+        managementMode: "add",
+        ruleType: "custom_formula",
+        formula: '=B2>1000',
+        style: {
+          underline: true,
+          strikethrough: false,
+          numberFormat: "#,##0.00",
+          textColor: "#111111"
+        }
+      }
+    }));
+
+    expect(parsed.data.style).toEqual({
+      underline: true,
+      strikethrough: false,
+      numberFormat: "#,##0.00",
+      textColor: "#111111"
+    });
+  });
+
+  it("normalizes raw external_data_plan steps inside composite plans before validation", () => {
+    const parsed = HermesStructuredBodySchema.parse(normalizeHermesStructuredBodyInput({
+      type: "composite_plan",
+      data: {
+        steps: [
+          {
+            stepId: "step_import_market",
+            dependsOn: [],
+            continueOnError: false,
+            plan: {
+              sourceType: "web_table_import",
+              provider: "importhtml",
+              sourceUrl: "https://example.com/markets",
+              selectorType: "table",
+              selector: 1,
+              targetSheet: "Imported Data",
+              targetRange: "A1",
+              formula: '=IMPORTHTML("https://example.com/markets","table",1)',
+              explanation: "Import the first public table.",
+              confidence: 0.89,
+              requiresConfirmation: true
+            }
+          }
+        ],
+        explanation: "Import one external table.",
+        confidence: 0.89,
+        requiresConfirmation: true,
+        affectedRanges: ["Imported Data!A1"],
+        overwriteRisk: "low",
+        confirmationLevel: "standard",
+        reversible: false,
+        dryRunRecommended: true,
+        dryRunRequired: false
+      }
+    }));
+
+    expect(parsed).toMatchObject({
+      type: "composite_plan",
+      data: {
+        steps: [
+          {
+            stepId: "step_import_market",
+            plan: {
+              sourceType: "web_table_import",
+              provider: "importhtml",
+              sourceUrl: "https://example.com/markets",
+              selectorType: "table",
+              selector: 1,
+              targetSheet: "Imported Data",
+              targetRange: "A1",
+              formula: '=IMPORTHTML("https://example.com/markets","table",1)',
+              affectedRanges: ["Imported Data!A1"],
+              overwriteRisk: "low",
+              confirmationLevel: "standard"
+            }
+          }
+        ]
+      }
+    });
+  });
+});

@@ -1,0 +1,35 @@
+{
+  "skills": [
+    {
+      "id": "selection-explainer",
+      "name": "SelectionExplainerSkill",
+      "version": "0.1.0",
+      "description": "Explains a spreadsheet selection or suggests a formula based on normalized range context.",
+      "entrypoint": "src/server.ts",
+      "runtime": "http-sidecar",
+      "permissions": [
+        "read:spreadsheet-context"
+      ],
+      "inputSchemaRef": "HermesRequest.context",
+      "outputSchemaRef": "HermesResponse",
+      "approvalMode": "manual",
+      "endpoint": "http://127.0.0.1:8791"
+    },
+    {
+      "id": "screenshot-table-extractor",
+      "name": "ScreenshotTableExtractionSkill",
+      "version": "0.1.0",
+      "description": "Turns a screenshot-like table attachment into a structured import plan preview.",
+      "entrypoint": "src/server.ts",
+      "runtime": "http-sidecar",
+      "permissions": [
+        "read:attachment-metadata",
+        "read:attachment-preview-url"
+      ],
+      "inputSchemaRef": "Attachment",
+      "outputSchemaRef": "SheetImportPlan",
+      "approvalMode": "manual",
+      "endpoint": "http://127.0.0.1:8792"
+    }
+  ]
+}

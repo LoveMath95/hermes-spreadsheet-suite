@@ -1,0 +1,11 @@
+node_modules
+dist
+.env
+.env.local
+.env.*.local
+.DS_Store
+coverage
+*.tsbuildinfo
+output/
+.playwright-cli/
+apps/google-sheets-addon/.clasp.json

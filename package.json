@@ -1,0 +1,31 @@
+{
+  "name": "hermes-spreadsheet-suite",
+  "private": true,
+  "version": "0.1.0",
+  "workspaces": [
+    "packages/*",
+    "services/*",
+    "apps/excel-addin",
+    "extensions/skills/*"
+  ],
+  "scripts": {
+    "build": "npm run build --workspaces --if-present",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "predev:gateway": "npm --workspace @hermes/contracts run build",
+    "dev:gateway": "npm --workspace @hermes/gateway run dev",
+    "deploy:google-sheets": "node --import tsx scripts/deploy_google_sheets_addon.ts",
+    "dev:selection-skill": "npm --workspace @hermes/selection-explainer-skill run dev",
+    "dev:table-skill": "npm --workspace @hermes/screenshot-table-extractor-skill run dev"
+  },
+  "devDependencies": {
+    "@types/cors": "^2.8.17",
+    "@types/express": "^5.0.1",
+    "@types/multer": "^2.0.0",
+    "@types/node": "^22.15.3",
+    "@types/supertest": "^6.0.3",
+    "supertest": "^7.1.0",
+    "typescript": "^5.8.3",
+    "vitest": "^3.1.2"
+  }
+}

@@ -1,0 +1,4399 @@
+<script>
+  const SUPPORTED_IMAGE_TYPES = new Set([
+    "image/png",
+    "image/jpeg",
+    "image/jpg",
+    "image/webp"
+  ]);
+
+  const state = {
+    runtimeConfig: null,
+    sessionId: safeStorageGetItem(window.localStorage, "hermesSessionId") || `sess_${generateClientUuid()}`,
+    messages: [],
+    pendingAttachments: []
+  };
+  let runtimeConfigPromise = null;
+  const MAX_REQUEST_MESSAGE_LENGTH = 16000;
+  const MAX_CONVERSATION_MESSAGES = 50;
+  const MAX_STORED_MESSAGES = 100;
+  const MAX_MESSAGE_TRACE_EVENTS = 200;
+  const REQUEST_TRUNCATION_SUFFIX = "...";
+  const ENABLE_LIVE_TRACE_POLLING = false;
+  const MESSAGE_POLL_INTERVAL_MS = 900;
+  const MESSAGE_POLL_MAX_INTERVAL_MS = 5000;
+  const TRACE_POLL_EVERY_N_ATTEMPTS = 3;
+  const EXECUTION_HISTORY_SHORTCUT_LIMIT = 20;
+  const UNDO_PROMPT_PATTERN = /^\s*(?:please\s+)?undo(?:\s+(?:that|it|this|last|latest|previous)(?:\s+(?:write|change|update))?)?\s*[.!?]*\s*$/i;
+  const REDO_PROMPT_PATTERN = /^\s*(?:please\s+)?redo(?:\s+(?:that|it|this|last|latest|previous)(?:\s+(?:write|change|update))?)?\s*[.!?]*\s*$/i;
+  const UNDER_SPECIFIED_AFFIRMATION_PATTERN = /^\s*(?:yes|yep|yeah|ok|okay|sure|please do|do it|go ahead|continue)\s*[.!?]*\s*$/i;
+  const LOCAL_EXECUTION_SNAPSHOT_STORAGE_PREFIX = "Hermes.ReversibleExecutions.v1::";
+  const MAX_LOCAL_EXECUTION_SNAPSHOTS = 100;
+  function generateClientUuid() {
+    const cryptoObject = globalThis.crypto;
+    if (cryptoObject && typeof cryptoObject.randomUUID === "function") {
+      return cryptoObject.randomUUID();
+    }
+
+    if (cryptoObject && typeof cryptoObject.getRandomValues === "function") {
+      const bytes = new Uint8Array(16);
+      cryptoObject.getRandomValues(bytes);
+      bytes[6] = (bytes[6] & 0x0f) | 0x40;
+      bytes[8] = (bytes[8] & 0x3f) | 0x80;
+      const hex = Array.from(bytes, (value) => value.toString(16).padStart(2, "0"));
+      return `${hex.slice(0, 4).join("")}-${hex.slice(4, 6).join("")}-${hex.slice(6, 8).join("")}-${hex.slice(8, 10).join("")}-${hex.slice(10, 16).join("")}`;
+    }
+
+    return `${Date.now().toString(36)}${Math.random().toString(36).slice(2, 10)}`;
+  }
+  safeStorageSetItem(window.localStorage, "hermesSessionId", state.sessionId);
+
+  function safeStorageGetItem(storage, key) {
+    try {
+      return storage && storage.getItem ? storage.getItem(key) : null;
+    } catch {
+      return null;
+    }
+  }
+
+  function safeStorageSetItem(storage, key, value) {
+    try {
+      if (storage && storage.setItem) {
+        storage.setItem(key, value);
+      }
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
+  function createDefaultRuntimeConfig() {
+    return {
+      gatewayBaseUrl: "",
+      clientVersion: "google-sheets-addon-dev",
+      reviewerSafeMode: false,
+      forceExtractionMode: null
+    };
+  }
+
+  async function ensureRuntimeConfig() {
+    if (state.runtimeConfig) {
+      return state.runtimeConfig;
+    }
+
+    if (!runtimeConfigPromise) {
+      runtimeConfigPromise = callServer("getRuntimeConfig")
+        .then((config) => {
+          state.runtimeConfig = {
+            ...createDefaultRuntimeConfig(),
+            ...(config && typeof config === "object" ? config : {})
+          };
+          return state.runtimeConfig;
+        })
+        .catch((error) => {
+          console.warn("Hermes could not load Google Sheets runtime config; using defaults.", error);
+          state.runtimeConfig = createDefaultRuntimeConfig();
+          return state.runtimeConfig;
+        })
+        .finally(() => {
+          runtimeConfigPromise = null;
+        });
+    }
+
+    return runtimeConfigPromise;
+  }
+
+  function getLocalExecutionSnapshotStoreKey(workbookSessionKey) {
+    return `${LOCAL_EXECUTION_SNAPSHOT_STORAGE_PREFIX}${workbookSessionKey}`;
+  }
+
+  function createEmptyLocalExecutionSnapshotStore() {
+    return {
+      version: 1,
+      order: [],
+      executions: {},
+      bases: {}
+    };
+  }
+
+  function normalizeLocalExecutionSnapshotStore(value) {
+    if (!value || typeof value !== "object" || Array.isArray(value)) {
+      return createEmptyLocalExecutionSnapshotStore();
+    }
+
+    return {
+      version: 1,
+      order: Array.isArray(value.order)
+        ? value.order.filter((entry) => typeof entry === "string" && entry.trim())
+        : [],
+      executions: value.executions && typeof value.executions === "object" && !Array.isArray(value.executions)
+        ? value.executions
+        : {},
+      bases: value.bases && typeof value.bases === "object" && !Array.isArray(value.bases)
+        ? value.bases
+        : {}
+    };
+  }
+
+  function readLocalExecutionSnapshotStore(workbookSessionKey) {
+    const raw = safeStorageGetItem(
+      window.localStorage,
+      getLocalExecutionSnapshotStoreKey(workbookSessionKey)
+    );
+    if (!raw) {
+      return createEmptyLocalExecutionSnapshotStore();
+    }
+
+    try {
+      return normalizeLocalExecutionSnapshotStore(JSON.parse(raw));
+    } catch {
+      return createEmptyLocalExecutionSnapshotStore();
+    }
+  }
+
+  function pruneLocalExecutionSnapshotStore(store) {
+    const normalized = normalizeLocalExecutionSnapshotStore(store);
+    while (normalized.order.length > MAX_LOCAL_EXECUTION_SNAPSHOTS) {
+      const removedExecutionId = normalized.order.shift();
+      if (!removedExecutionId) {
+        break;
+      }
+      delete normalized.executions[removedExecutionId];
+    }
+
+    const referencedBaseIds = new Set(
+      Object.values(normalized.executions)
+        .map((entry) => entry && typeof entry === "object" ? entry.baseExecutionId : null)
+        .filter((entry) => typeof entry === "string" && entry.trim())
+    );
+
+    Object.keys(normalized.bases).forEach((baseExecutionId) => {
+      if (!referencedBaseIds.has(baseExecutionId)) {
+        delete normalized.bases[baseExecutionId];
+      }
+    });
+
+    return normalized;
+  }
+
+  function writeLocalExecutionSnapshotStore(workbookSessionKey, store) {
+    return safeStorageSetItem(
+      window.localStorage,
+      getLocalExecutionSnapshotStoreKey(workbookSessionKey),
+      JSON.stringify(pruneLocalExecutionSnapshotStore(store))
+    );
+  }
+
+  function stripLocalExecutionSnapshot(result) {
+    if (!result || typeof result !== "object" || Array.isArray(result)) {
+      return result;
+    }
+
+    const { __hermesLocalExecutionSnapshot: _localExecutionSnapshot, ...rest } = result;
+    return rest;
+  }
+
+  function persistLocalExecutionSnapshot(workbookSessionKey, executionId, snapshot) {
+    if (!workbookSessionKey || !executionId || !snapshot || !snapshot.baseExecutionId) {
+      return false;
+    }
+
+    const store = readLocalExecutionSnapshotStore(workbookSessionKey);
+    store.bases[snapshot.baseExecutionId] = snapshot;
+    store.executions[executionId] = {
+      baseExecutionId: snapshot.baseExecutionId
+    };
+    store.order = store.order.filter((entry) => entry !== executionId);
+    store.order.push(executionId);
+    return writeLocalExecutionSnapshotStore(workbookSessionKey, store);
+  }
+
+  function getLocalExecutionSnapshot(workbookSessionKey, executionId) {
+    if (!workbookSessionKey || !executionId) {
+      return null;
+    }
+
+    const store = readLocalExecutionSnapshotStore(workbookSessionKey);
+    const executionEntry = store.executions[executionId];
+    if (!executionEntry || !executionEntry.baseExecutionId) {
+      return null;
+    }
+
+    return store.bases[executionEntry.baseExecutionId] || null;
+  }
+
+  function linkLocalExecutionSnapshot(workbookSessionKey, executionId, previousExecutionId) {
+    const snapshot = getLocalExecutionSnapshot(workbookSessionKey, previousExecutionId);
+    if (!snapshot) {
+      return false;
+    }
+
+    return persistLocalExecutionSnapshot(workbookSessionKey, executionId, snapshot);
+  }
+
+  function assertLocalExecutionSnapshotStoreWritable(workbookSessionKey, snapshot, mode) {
+    if (!workbookSessionKey || !snapshot || !snapshot.baseExecutionId) {
+      throw new Error("That history entry is no longer available in this sheet session.");
+    }
+
+    const probeExecutionId = `probe_${mode}_${generateClientUuid()}`;
+    const store = readLocalExecutionSnapshotStore(workbookSessionKey);
+    const nextStore = {
+      ...store,
+      order: [...(store.order || []), probeExecutionId],
+      executions: {
+        ...(store.executions || {}),
+        [probeExecutionId]: {
+          baseExecutionId: snapshot.baseExecutionId
+        }
+      },
+      bases: {
+        ...(store.bases || {}),
+        [snapshot.baseExecutionId]: snapshot
+      }
+    };
+
+    if (!writeLocalExecutionSnapshotStore(workbookSessionKey, nextStore)) {
+      throw new Error("That history entry is no longer available for exact undo or redo in this sheet session.");
+    }
+
+    const cleanedStore = readLocalExecutionSnapshotStore(workbookSessionKey);
+    if (cleanedStore.executions) {
+      delete cleanedStore.executions[probeExecutionId];
+    }
+    cleanedStore.order = (cleanedStore.order || []).filter((entry) => entry !== probeExecutionId);
+    writeLocalExecutionSnapshotStore(workbookSessionKey, cleanedStore);
+  }
+
+  function prepareGatewayWritebackResult(result, executionId, workbookSessionKey) {
+    const snapshot = result && result.__hermesLocalExecutionSnapshot;
+    const strippedResult = stripLocalExecutionSnapshot(result);
+
+    if (!snapshot || !executionId || !workbookSessionKey) {
+      return strippedResult;
+    }
+
+    if (!persistLocalExecutionSnapshot(workbookSessionKey, executionId, snapshot)) {
+      return strippedResult;
+    }
+
+    return {
+      ...strippedResult,
+      undoReady: true
+    };
+  }
+
+  const elements = {
+    app: document.getElementById("app"),
+    messages: document.getElementById("messages"),
+    prompt: document.getElementById("prompt"),
+    sendButton: document.getElementById("send-button"),
+    fileInput: document.getElementById("file-input"),
+    attachmentStrip: document.getElementById("attachment-strip")
+  };
+
+  function callServer(functionName, ...args) {
+    return new Promise((resolve, reject) => {
+      google.script.run
+        .withSuccessHandler(resolve)
+        .withFailureHandler((error) =>
+          reject(new Error(sanitizeHostExecutionError(error, "Request failed.")))
+        )
+        [functionName](...args);
+    });
+  }
+
+  function formatUserFacingErrorText(message, userAction) {
+    const resolvedMessage = String(message || "").trim();
+    const resolvedUserAction = typeof userAction === "string" ? userAction.trim() : "";
+
+    if (!resolvedUserAction || resolvedUserAction === resolvedMessage) {
+      return resolvedMessage;
+    }
+
+    return `${resolvedMessage}\n\n${resolvedUserAction}`;
+  }
+
+  function sanitizeHostExecutionError(error, fallbackMessage) {
+    const rawMessage = error instanceof Error ? error.message : String(error || "");
+    const message = String(rawMessage || "").trim().replace(/^Error:\s*/i, "");
+
+    if (!message) {
+      return fallbackMessage || "Write-back failed.";
+    }
+
+    if (/Hermes gateway URL is not configured/i.test(message)) {
+      return formatUserFacingErrorText(
+        "The Hermes connection is not configured for this sheet.",
+        "Set the Hermes gateway URL, reload the sidebar, and retry."
+      );
+    }
+
+    if (
+      /Hermes gateway returned invalid JSON/i.test(message) ||
+      /structured gateway contract/i.test(message)
+    ) {
+      return formatUserFacingErrorText(
+        "The Hermes service returned a response the sidebar could not use.",
+        "Retry the request. If it keeps happening, reload the sidebar or check the Hermes gateway."
+      );
+    }
+
+    if (/Hermes gateway proxy requires a request path/i.test(message)) {
+      return formatUserFacingErrorText(
+        "The Hermes request could not be sent correctly.",
+        "Retry the action. If it keeps happening, reload the sidebar and try again."
+      );
+    }
+
+    if (/^The requested resource doesn't exist\.?$/i.test(message)) {
+      return formatUserFacingErrorText(
+        "Hermes could not read the current sheet or selection.",
+        "Select a normal sheet range, reload the sidebar, and retry. If it keeps happening, reopen the spreadsheet and try again."
+      );
+    }
+
+    if (/Failed to fetch/i.test(message) || /NetworkError/i.test(message)) {
+      return formatUserFacingErrorText(
+        "The Hermes service could not be reached.",
+        "Check the network connection or Hermes gateway, then retry."
+      );
+    }
+
+    if (/Destructive confirmation is unavailable in this host/i.test(message)) {
+      return formatUserFacingErrorText(
+        "This spreadsheet app cannot approve destructive changes inline.",
+        "Ask Hermes for a safer alternative, or use a non-destructive step first."
+      );
+    }
+
+    if (/exact (?:undo|redo) snapshot/i.test(message) || /saved undo snapshot/i.test(message)) {
+      return formatUserFacingErrorText(
+        "That history entry is no longer available for exact undo or redo in this sheet session.",
+        "Re-run the change, then use undo or redo again from the current session."
+      );
+    }
+
+    const targetSheetMatch = message.match(/^Target sheet not found:\s*(.+)$/i);
+    if (targetSheetMatch) {
+      return formatUserFacingErrorText(
+        `Sheet "${targetSheetMatch[1].trim()}" was not found.`,
+        "Create or select that sheet, then retry."
+      );
+    }
+
+    const sourceSheetMatch = message.match(/^(?:Validation )?Source sheet not found:\s*(.+)$/i);
+    if (sourceSheetMatch) {
+      return formatUserFacingErrorText(
+        `Sheet "${sourceSheetMatch[1].trim()}" was not found.`,
+        "Select a valid source sheet, then retry."
+      );
+    }
+
+    const namedRangeMatch = message.match(/^Named range not found:\s*(.+)$/i);
+    if (namedRangeMatch) {
+      return formatUserFacingErrorText(
+        `Named range "${namedRangeMatch[1].trim()}" was not found.`,
+        "Check the range name or create it first, then retry."
+      );
+    }
+
+    const invalidRangeMatch = message.match(/^Unsupported A1 reference:\s*(.+)$/i);
+    if (invalidRangeMatch) {
+      return formatUserFacingErrorText(
+        `Range "${invalidRangeMatch[1].trim()}" is not a valid A1 reference.`,
+        "Use a valid cell or range address, then retry."
+      );
+    }
+
+    const duplicateHeaderMatch = message.match(/duplicate header:\s*(.+?)\.?$/i);
+    if (duplicateHeaderMatch) {
+      return formatUserFacingErrorText(
+        `Column "${duplicateHeaderMatch[1].trim()}" appears more than once in the header row.`,
+        "Rename duplicate columns or select a table with unique headers, then retry."
+      );
+    }
+
+    if (/requires a header row/i.test(message)) {
+      return formatUserFacingErrorText(
+        "This action needs a table with a header row.",
+        "Select or create a table with column headers, then retry."
+      );
+    }
+
+    const missingHeaderFieldMatch = message.match(/cannot find (?:pivot|chart) field in header row:\s*(.+?)\.?$/i);
+    if (missingHeaderFieldMatch) {
+      return formatUserFacingErrorText(
+        `Column "${missingHeaderFieldMatch[1].trim()}" was not found in the header row.`,
+        "Select the full table with headers, or use the exact column name in the request and retry."
+      );
+    }
+
+    if (
+      /could not resolve any valid sort keys/i.test(message) ||
+      /could not resolve a filter column inside the target range/i.test(message) ||
+      /Column .* is outside /i.test(message)
+    ) {
+      return formatUserFacingErrorText(
+        "The selected range does not include the columns this step needs.",
+        "Select the full table, or update the request to use columns inside the chosen range."
+      );
+    }
+
+    const invalidDateMatch = message.match(/^Invalid date literal:\s*(.+)$/i);
+    if (invalidDateMatch) {
+      return formatUserFacingErrorText(
+        `The date "${invalidDateMatch[1].trim()}" is not valid.`,
+        "Use a real calendar date such as 2026-04-22, then retry."
+      );
+    }
+
+    if (
+      /Unsupported filter operator/i.test(message) ||
+      /grid filters cannot represent operator "topN" exactly/i.test(message)
+    ) {
+      return formatUserFacingErrorText(
+        "This filter condition is not supported here.",
+        "Try a simpler operator such as equals or contains, or ask Hermes for a different filter."
+      );
+    }
+
+    if (
+      /Unsupported filter combiner/i.test(message) ||
+      /filter combiners other than and/i.test(message) ||
+      /multiple conditions for the same column/i.test(message) ||
+      /cannot represent combiner "or" exactly/i.test(message)
+    ) {
+      return formatUserFacingErrorText(
+        "This spreadsheet app cannot combine those filter conditions in one exact step.",
+        "Use a single filter rule per column, or split the filter into smaller steps."
+      );
+    }
+
+    if (
+      /named ranges? on this scope/i.test(message) ||
+      /sheet-scoped named ranges/i.test(message) ||
+      /does not support creating named ranges/i.test(message) ||
+      /does not support renaming named ranges/i.test(message) ||
+      /does not support deleting named ranges/i.test(message) ||
+      /does not support retargeting named ranges/i.test(message) ||
+      /Unsupported named range update/i.test(message)
+    ) {
+      return formatUserFacingErrorText(
+        "This named range action is not supported in this spreadsheet app.",
+        "Use a workbook-level named range or ask Hermes for a simpler named range update."
+      );
+    }
+
+    if (
+      /Named range create and retarget require targetSheet and targetRange/i.test(message) ||
+      /Named range rename requires newName/i.test(message)
+    ) {
+      return formatUserFacingErrorText(
+        "This named range request is missing required details.",
+        "Include the destination sheet and range, or provide the new name, then retry."
+      );
+    }
+
+    if (/approved targetRange does not match/i.test(message)) {
+      return formatUserFacingErrorText(
+        "The spreadsheet changed, so the approved destination no longer matches the intended shape.",
+        "Refresh the spreadsheet state and run the request again."
+      );
+    }
+
+    if (
+      /cannot append exactly when the approved target range contains internal gaps/i.test(message) ||
+      /cannot append exactly within the approved target range/i.test(message) ||
+      /cannot split this column exactly within the approved target range/i.test(message)
+    ) {
+      return formatUserFacingErrorText(
+        "The chosen destination range cannot accept this write safely.",
+        "Choose a clean target range or ask Hermes to write into a blank area."
+      );
+    }
+
+    if (
+      /cannot apply an overlapping .* transfer exactly/i.test(message) ||
+      /cannot clear the source range for this move/i.test(message) ||
+      /Unsupported transfer pasteMode/i.test(message) ||
+      /does not support exact-safe transfer pasteMode/i.test(message) ||
+      /cannot append when the approved target range width does not match/i.test(message) ||
+      /cannot expand the approved append anchor exactly/i.test(message)
+    ) {
+      return formatUserFacingErrorText(
+        "This transfer cannot be applied safely on the current source and destination ranges.",
+        "Choose a simpler target range or ask Hermes for a different transfer plan."
+      );
+    }
+
+    if (/does not support exact-safe pivot table creation yet/i.test(message)) {
+      return formatUserFacingErrorText(
+        "This spreadsheet app cannot create that pivot table safely yet.",
+        "Ask for a preview only, or target a simpler transformation first."
+      );
+    }
+
+    if (/does not support exact-safe chart/i.test(message)) {
+      return formatUserFacingErrorText(
+        "This spreadsheet app cannot create that chart safely yet.",
+        "Ask for a preview only, or request a simpler supported chart."
+      );
+    }
+
+    if (
+      /does not support exact-safe formula transfers on this range/i.test(message) ||
+      /does not support exact-safe format transfers on this range/i.test(message) ||
+      /does not support exact format append transfers on this range/i.test(message)
+    ) {
+      return formatUserFacingErrorText(
+        "This spreadsheet app cannot apply that transfer safely on the current range.",
+        "Try a simpler target range or ask Hermes for a direct cell update instead."
+      );
+    }
+
+    if (
+      /does not support exact-safe cleanup semantics/i.test(message) ||
+      /cannot apply cleanup plans exactly when the target range contains formulas/i.test(message)
+    ) {
+      return formatUserFacingErrorText(
+        "This cleanup action cannot be applied safely on the current range.",
+        "Try a narrower range or ask Hermes for a simpler cleanup step."
+      );
+    }
+
+    if (
+      /Unsupported .*data validation rule type/i.test(message) ||
+      /Unsupported .*validation comparator/i.test(message) ||
+      /Unsupported invalidDataBehavior/i.test(message) ||
+      /List validation requires values, sourceRange, or namedRangeName/i.test(message) ||
+      /Custom formula validation requires/i.test(message) ||
+      /checkbox .* only support boolean true\/false/i.test(message) ||
+      /cannot represent allowBlank/i.test(message) ||
+      /uncheckedValue without checkedValue/i.test(message)
+    ) {
+      return formatUserFacingErrorText(
+        "This validation setup cannot be represented safely here.",
+        "Try a simpler dropdown, checkbox, or date rule, then retry."
+      );
+    }
+
+    if (
+      /requires a valid target range for /i.test(message) ||
+      /requires a single-cell target anchor for /i.test(message)
+    ) {
+      return formatUserFacingErrorText(
+        "This action needs a valid destination cell or anchor.",
+        "Choose a single target cell or a valid destination range, then retry."
+      );
+    }
+
+    if (
+      /conditional-format/i.test(message) ||
+      /conditional formatting/i.test(message) ||
+      /text_contains conditional formatting/i.test(message)
+    ) {
+      return formatUserFacingErrorText(
+        "This conditional formatting step is not supported here.",
+        "Try a simpler highlight rule, or ask Hermes for a preview-only result first."
+      );
+    }
+
+    if (
+      /does not support data validation on this range/i.test(message) ||
+      /does not support checkbox cell controls on this range/i.test(message) ||
+      /does not expose checkbox cell control support/i.test(message)
+    ) {
+      return formatUserFacingErrorText(
+        "This validation action cannot run on the current range.",
+        "Choose a standard editable cell range, then retry."
+      );
+    }
+
+    if (
+      /does not support range sort on this selection/i.test(message) ||
+      /does not support range filters on this selection/i.test(message) ||
+      /does not support conditional formatting on this range/i.test(message) ||
+      /does not support conditional formatting on this sheet/i.test(message)
+    ) {
+      return formatUserFacingErrorText(
+        "This action cannot run on the current selection.",
+        "Choose a standard table or cell range, then retry."
+      );
+    }
+
+    if (/Cannot hide the only visible worksheet/i.test(message)) {
+      return formatUserFacingErrorText(
+        "At least one worksheet must stay visible.",
+        "Keep another sheet visible or unhide one first, then retry."
+      );
+    }
+
+    if (
+      /Unsupported workbook structure update/i.test(message) ||
+      /Unsupported sheet structure update/i.test(message)
+    ) {
+      return formatUserFacingErrorText(
+        "This sheet change is not supported in this spreadsheet app.",
+        "Ask Hermes for a simpler sheet change, or try a different supported operation."
+      );
+    }
+
+    if (
+      /pivot/i.test(message) &&
+      (
+        /does not support/i.test(message) ||
+        /requires /i.test(message) ||
+        /Unsupported pivot aggregation/i.test(message) ||
+        /only supports equal_to pivot filters/i.test(message) ||
+        /pivot filter criteria builders/i.test(message) ||
+        /does not expose pivot creation/i.test(message)
+      )
+    ) {
+      return formatUserFacingErrorText(
+        "This pivot configuration is not supported here yet.",
+        "Try a simpler pivot, or ask Hermes for a preview-only result first."
+      );
+    }
+
+    if (
+      /chart/i.test(message) &&
+      (
+        /does not support/i.test(message) ||
+        /requires /i.test(message) ||
+        /chart type/i.test(message) ||
+        /legend positioning/i.test(message) ||
+        /series fields/i.test(message) ||
+        /series labels/i.test(message)
+      )
+    ) {
+      return formatUserFacingErrorText(
+        "This chart configuration is not supported here yet.",
+        "Try a simpler chart, or ask Hermes for a preview-only result first."
+      );
+    }
+
+    if (/Target range already contains content/i.test(message)) {
+      return formatUserFacingErrorText(
+        "The destination already contains data.",
+        "Clear that range or choose a blank destination, then retry."
+      );
+    }
+
+    if (/chat-only analysis reports are not writeback eligible/i.test(message)) {
+      return formatUserFacingErrorText(
+        "This result is analysis only and cannot be applied directly.",
+        "Ask Hermes to turn it into a specific writeback on a sheet or range."
+      );
+    }
+
+    if (
+      /Composite workflow execution requires executionId/i.test(message) ||
+      /Dependency .* has not completed before this step/i.test(message)
+    ) {
+      return formatUserFacingErrorText(
+        "This workflow is no longer valid for the current spreadsheet state.",
+        "Run the request again so Hermes can rebuild the workflow before applying it."
+      );
+    }
+
+    return message;
+  }
+
+  function isTraceUnavailablePollError(error) {
+    const rawMessage = error instanceof Error ? error.message : String(error || "");
+    return /Hermes trace is no longer available/i.test(rawMessage) ||
+      (/trace/i.test(rawMessage) && /fresh trace/i.test(rawMessage));
+  }
+
+  function isTraceBandwidthPollError(error) {
+    const rawMessage = error instanceof Error ? error.message : String(error || "");
+    return /bandwidth quota exceeded/i.test(rawMessage) ||
+      /reducing the rate of data transfer/i.test(rawMessage) ||
+      /too much data/i.test(rawMessage);
+  }
+
+  function shouldPollTraceForMessage(message) {
+    if (!message || message.tracePollingDisabled) {
+      return false;
+    }
+
+    const attempt = Number(message.pollAttemptCount || 0);
+    return attempt <= 1 || attempt % TRACE_POLL_EVERY_N_ATTEMPTS === 0;
+  }
+
+  function getNextMessagePollDelay(message) {
+    const currentDelay = Number(message && message.pollDelayMs) > 0
+      ? Number(message.pollDelayMs)
+      : MESSAGE_POLL_INTERVAL_MS;
+    return Math.min(Math.round(currentDelay * 1.5), MESSAGE_POLL_MAX_INTERVAL_MS);
+  }
+
+  async function parseGatewayJsonResponse(response) {
+    if (!response.ok) {
+      let message = `Request failed with ${response.status}`;
+      const responseUrl = response.url || `${buildGatewayUrl("") || "(unknown gateway)"}/(unknown)`;
+      try {
+        const payload = await response.json();
+        const rawMessage = payload && payload.error && payload.error.message
+          ? payload.error.message
+          : payload && payload.error
+            ? payload.error
+            : payload && payload.message
+              ? payload.message
+              : message;
+        const userAction = payload && payload.error && payload.error.userAction
+          ? payload.error.userAction
+          : payload && payload.userAction
+            ? payload.userAction
+            : undefined;
+        if (
+          response.status === 404 &&
+          typeof rawMessage === "string" &&
+          rawMessage.trim().toLowerCase() === "the requested resource doesn't exist."
+        ) {
+          message = formatUserFacingErrorText(
+            `The Hermes request was sent to a service path that does not exist (${responseUrl}, HTTP ${response.status}).`,
+            "Reload the sidebar and retry. If it keeps happening, reload the current deployment so Hermes uses the correct gateway path."
+          );
+        } else {
+          message = formatUserFacingErrorText(rawMessage, userAction);
+        }
+      } catch (_error) {
+        const text = await response.text();
+        if (text) {
+          const trimmed = text.trim();
+          if (trimmed.toLowerCase() === "the requested resource doesn't exist.") {
+            message = formatUserFacingErrorText(
+              `The Hermes request was sent to a service path that does not exist (${responseUrl}, HTTP ${response.status}).`,
+              "Reload the sidebar and retry. If it keeps happening, reload the current deployment so Hermes uses the correct gateway path."
+            );
+          } else if (/^<!doctype html/i.test(trimmed) || /^<html/i.test(trimmed)) {
+            message = formatUserFacingErrorText(
+              `The Hermes request was sent to a page that is not the Hermes gateway (${responseUrl}, HTTP ${response.status}).`,
+              "Reload the sidebar and retry. If it keeps happening, check the configured Hermes gateway."
+            );
+          } else {
+            message = text;
+          }
+        }
+      }
+      throw new Error(message);
+    }
+
+    return response.json();
+  }
+
+  function buildGatewayUrl(path) {
+    const baseUrl = String(getGatewayBaseUrl() || "").replace(/\/+$/, "");
+    const normalizedPath = String(path || "").trim();
+
+    if (!baseUrl) {
+      return "";
+    }
+
+    if (!normalizedPath) {
+      return baseUrl;
+    }
+
+    return normalizedPath.charAt(0) === "/"
+      ? `${baseUrl}${normalizedPath}`
+      : `${baseUrl}/${normalizedPath}`;
+  }
+
+  function proxyGatewayJson(path, options = {}) {
+    const hasBody = Object.prototype.hasOwnProperty.call(options, "body");
+    return callServer("proxyGatewayJson", {
+      path,
+      method: options.method || "get",
+      headers: options.headers || {},
+      body: hasBody ? options.body : null
+    });
+  }
+
+  async function callGatewayJson(path, options = {}) {
+    await ensureRuntimeConfig();
+    const gatewayUrl = buildGatewayUrl(path);
+    const allowProxyFallback = options.allowProxyFallback !== false;
+    if (gatewayUrl && typeof fetch === "function") {
+      const hasBody = Object.prototype.hasOwnProperty.call(options, "body");
+      const requestInit = {
+        method: options.method || "get",
+        headers: options.headers || {}
+      };
+
+      if (hasBody) {
+        requestInit.body = typeof options.body === "string"
+          ? options.body
+          : JSON.stringify(options.body);
+      }
+
+      let response;
+      try {
+        response = await fetch(gatewayUrl, requestInit);
+      } catch (_error) {
+        if (allowProxyFallback) {
+          return proxyGatewayJson(path, options);
+        }
+        throw _error;
+      }
+
+      return parseGatewayJsonResponse(response);
+    }
+
+    if (!allowProxyFallback) {
+      throw new Error("Hermes trace streaming is unavailable in this browser.");
+    }
+
+    return proxyGatewayJson(path, options);
+  }
+
+  function readFileAsBase64Data(file) {
+    return new Promise((resolve, reject) => {
+      const reader = new FileReader();
+      reader.onload = () => {
+        const dataUrl = String(reader.result || "");
+        const commaIndex = dataUrl.indexOf(",");
+        resolve(commaIndex === -1 ? dataUrl : dataUrl.slice(commaIndex + 1));
+      };
+      reader.onerror = () => reject(reader.error || new Error("Failed to read attachment."));
+      reader.readAsDataURL(file);
+    });
+  }
+
+  function escapeHtml(value) {
+    return String(value)
+      .replaceAll("&", "&amp;")
+      .replaceAll("<", "&lt;")
+      .replaceAll(">", "&gt;");
+  }
+
+  function parseBooleanSetting(value) {
+    return value === true || value === "true" || value === "1";
+  }
+
+  function createRequestId() {
+    return `req_${generateClientUuid()}`;
+  }
+
+  function truncateRequestText(value) {
+    const text = String(value || "");
+    if (text.length <= MAX_REQUEST_MESSAGE_LENGTH) {
+      return text;
+    }
+
+    return `${text.slice(0, MAX_REQUEST_MESSAGE_LENGTH - REQUEST_TRUNCATION_SUFFIX.length)}${REQUEST_TRUNCATION_SUFFIX}`;
+  }
+
+  function sanitizeConversation(messages) {
+    return messages
+      .filter((message) =>
+        (message.role === "user" || message.role === "assistant" || message.role === "system") &&
+        message.content &&
+        message.content !== "Thinking..."
+      )
+      .map((message) => ({
+        role: message.role,
+        content: truncateRequestText(message.content)
+      }))
+      .slice(-MAX_CONVERSATION_MESSAGES);
+  }
+
+  function pruneStoredMessages(messages) {
+    return Array.isArray(messages)
+      ? messages.slice(-MAX_STORED_MESSAGES)
+      : [];
+  }
+
+  function appendStoredMessage(message) {
+    state.messages = pruneStoredMessages([...(state.messages || []), message]);
+    return message;
+  }
+
+  function trimMessageTraceEvents(trace) {
+    return Array.isArray(trace)
+      ? trace.slice(-MAX_MESSAGE_TRACE_EVENTS)
+      : [];
+  }
+
+  function setMessageResponse(message, response) {
+    if (!message) {
+      return;
+    }
+
+    if (!response || !Array.isArray(response.trace)) {
+      message.response = response;
+      return;
+    }
+
+    const trimmedTrace = trimMessageTraceEvents(response.trace);
+    message.response = {
+      ...response,
+      trace: trimmedTrace
+    };
+    message.trace = trimmedTrace;
+  }
+
+  function isSupportedImageFile(file) {
+    return SUPPORTED_IMAGE_TYPES.has(String(file && file.type || "").toLowerCase());
+  }
+
+  function filterSupportedImageFiles(files) {
+    return Array.from(files || []).filter((file) => isSupportedImageFile(file));
+  }
+
+  function getTraceLabel(event) {
+    const labels = {
+      request_received: "Request received by Hermes",
+      spreadsheet_context_received: "Spreadsheet context received",
+      attachment_received: "Attachment received",
+      image_received: "Image received",
+      skill_selected: "Skill selected",
+      tool_selected: "Tool selected",
+      downstream_provider_called: "Downstream provider called",
+      ocr_started: "OCR started",
+      table_extraction_started: "Table extraction started",
+      result_generated: "Result generated",
+      workbook_structure_update_ready: "Workbook update plan ready",
+      sheet_structure_update_ready: "Sheet structure plan ready",
+      range_sort_plan_ready: "Range sort plan ready",
+      range_filter_plan_ready: "Range filter plan ready",
+      range_format_update_ready: "Formatting plan ready",
+      conditional_format_plan_ready: "Conditional formatting plan ready",
+      data_validation_plan_ready: "Validation plan ready",
+      named_range_update_ready: "Named range update plan ready",
+      range_transfer_plan_ready: "Range transfer plan ready",
+      data_cleanup_plan_ready: "Data cleanup plan ready",
+      external_data_plan_ready: "External data plan ready",
+      analysis_report_plan_ready: "Analysis report plan ready",
+      pivot_table_plan_ready: "Pivot table plan ready",
+      chart_plan_ready: "Chart plan ready",
+      analysis_report_update_ready: "Analysis report update ready",
+      pivot_table_update_ready: "Pivot table update ready",
+      chart_update_ready: "Chart update ready",
+      sheet_update_plan_ready: "Sheet update plan ready",
+      sheet_import_plan_ready: "Sheet import plan ready",
+      completed: "Completed",
+      failed: "Failed"
+    };
+    return event.label || labels[event.event] || "Waiting for Hermes";
+  }
+
+  function summarizeLatestTrace(trace) {
+    if (!trace || trace.length === 0) {
+      return "Waiting for Hermes";
+    }
+    return getTraceLabel(trace[trace.length - 1]);
+  }
+
+  function formatTraceTimeline(trace) {
+    if (!trace || trace.length === 0) {
+      return "";
+    }
+
+    return trace
+      .map(getTraceLabel)
+      .filter((label, index, labels) => index === 0 || label !== labels[index - 1])
+      .join(" -> ");
+  }
+
+  function getResponseBodyText(response) {
+    switch (response.type) {
+      case "chat":
+        return response.data.message;
+      case "formula":
+        return response.data.explanation;
+      case "analysis_report_plan":
+        return response.data.outputMode === "materialize_report"
+          ? `Prepared an analysis report preview for ${resolveMaterializedAnalysisReportPlan(response.data).targetSheet}!${resolveMaterializedAnalysisReportPlan(response.data).targetRange}.`
+          : `Prepared a chat-only analysis report for ${response.data.sourceSheet}!${response.data.sourceRange}.`;
+      case "pivot_table_plan":
+        return `Prepared a pivot table preview for ${response.data.targetSheet}!${response.data.targetRange}.`;
+      case "chart_plan":
+        return `Prepared a chart preview for ${response.data.targetSheet}!${response.data.targetRange}.`;
+      case "external_data_plan":
+        return `Prepared an external data preview for ${response.data.targetSheet}!${response.data.targetRange}.`;
+      case "workbook_structure_update":
+        switch (response.data.operation) {
+          case "create_sheet":
+            return `Prepared a workbook update to create sheet ${response.data.sheetName}.`;
+          case "delete_sheet":
+            return `Prepared a workbook update to delete sheet ${response.data.sheetName}.`;
+          case "rename_sheet":
+            return `Prepared a workbook update to rename ${response.data.sheetName} to ${response.data.newSheetName}.`;
+          case "duplicate_sheet":
+            return `Prepared a workbook update to duplicate sheet ${response.data.sheetName}.`;
+          case "move_sheet":
+            return `Prepared a workbook update to move sheet ${response.data.sheetName}.`;
+          case "hide_sheet":
+            return `Prepared a workbook update to hide sheet ${response.data.sheetName}.`;
+          case "unhide_sheet":
+            return `Prepared a workbook update to unhide sheet ${response.data.sheetName}.`;
+          default:
+            return "Prepared a workbook update.";
+        }
+      case "sheet_structure_update":
+        return `Prepared a sheet structure update for ${response.data.targetSheet}.`;
+      case "range_sort_plan":
+        return `Prepared a sort plan for ${response.data.targetSheet}!${response.data.targetRange}.`;
+      case "range_filter_plan":
+        return `Prepared a filter plan for ${response.data.targetSheet}!${response.data.targetRange}.`;
+      case "range_format_update":
+        return `Prepared a formatting update for ${response.data.targetSheet}!${response.data.targetRange}.`;
+      case "conditional_format_plan":
+        return `Prepared a conditional formatting plan for ${response.data.targetSheet}!${response.data.targetRange}.`;
+      case "data_validation_plan":
+        return `Prepared a validation plan for ${response.data.targetSheet}!${response.data.targetRange}.`;
+      case "named_range_update":
+        return `Prepared a named range update for ${response.data.name}.`;
+      case "range_transfer_plan":
+        return `Prepared a transfer plan from ${response.data.sourceSheet}!${response.data.sourceRange} to ${response.data.targetSheet}!${response.data.targetRange}.`;
+      case "data_cleanup_plan":
+        return `Prepared a cleanup plan for ${response.data.targetSheet}!${response.data.targetRange}.`;
+      case "composite_plan":
+        return `Prepared a workflow preview with ${response.data.steps.length} step${response.data.steps.length === 1 ? "" : "s"}.`;
+      case "analysis_report_update":
+      case "pivot_table_update":
+      case "chart_update":
+        return response.data.summary;
+      case "sheet_update":
+        return response.data.explanation;
+      case "sheet_import_plan":
+        return `Prepared an import preview for ${response.data.targetSheet}!${response.data.targetRange}.`;
+      case "attachment_analysis":
+        return response.data.summary;
+      case "extracted_table":
+        return "Prepared an extracted table preview from the uploaded image.";
+      case "document_summary":
+        return response.data.summary;
+      case "error":
+        return formatUserFacingErrorText(response.data.message, response.data.userAction);
+      default:
+        return "Processed by Hermes.";
+    }
+  }
+
+  function applyWritebackResultToMessage(message, result) {
+    message.content = getWritebackStatusLine(result);
+    message.response = null;
+    message.statusLine = "";
+    delete message.pendingCompletion;
+  }
+
+  function buildPendingWritebackCompletionRequest(message, approval, result) {
+    return {
+      requestId: message.requestId,
+      runId: message.runId,
+      approvalToken: approval.approvalToken,
+      planDigest: approval.planDigest,
+      result
+    };
+  }
+
+  function getPendingCompletionRetryStatus() {
+    return "Applied locally. Retry confirm to finish syncing Hermes history.";
+  }
+
+  function normalizeConfirmationText(value) {
+    return String(value || "")
+      .trim()
+      .replace(/^['"`]+|['"`]+$/g, "")
+      .replace(/\s+/g, " ")
+      .toLowerCase();
+  }
+
+  function isTypedConfirmationPrompt(prompt) {
+    return /^(confirm|approve|proceed|yes)\b/i.test(String(prompt || "").trim());
+  }
+
+  function extractQuotedConfirmationTargets(prompt) {
+    return Array.from(String(prompt || "").matchAll(/["'`“”]([^"'`“”]+)["'`“”]/g))
+      .map((match) => normalizeConfirmationText(match[1]))
+      .filter(Boolean);
+  }
+
+  function extractWorkbookSheetConfirmationTargets(prompt) {
+    const targets = extractQuotedConfirmationTargets(prompt);
+    const sheetTailMatch = String(prompt || "").match(/\b(?:sheet|tab|worksheet)\s+(?:named\s+|called\s+)?(.+?)\s*$/i);
+    if (sheetTailMatch && sheetTailMatch[1]) {
+      const tail = normalizeConfirmationText(sheetTailMatch[1]);
+      if (tail) {
+        targets.push(tail);
+      }
+    }
+    return Array.from(new Set(targets));
+  }
+
+  function addNormalizedConfirmationTarget(targets, value) {
+    const normalized = normalizeConfirmationText(value);
+    if (normalized) {
+      targets.add(normalized);
+    }
+  }
+
+  function collectPlanConfirmationTargets(plan, targets) {
+    if (!plan || typeof plan !== "object") {
+      return;
+    }
+
+    addNormalizedConfirmationTarget(targets, plan.sheetName);
+    addNormalizedConfirmationTarget(targets, plan.newSheetName);
+    addNormalizedConfirmationTarget(targets, plan.name);
+    addNormalizedConfirmationTarget(targets, plan.targetSheet);
+    addNormalizedConfirmationTarget(targets, plan.targetRange);
+    addNormalizedConfirmationTarget(targets, plan.sourceSheet);
+    addNormalizedConfirmationTarget(targets, plan.sourceRange);
+
+    if (typeof plan.targetSheet === "string" && typeof plan.targetRange === "string") {
+      addNormalizedConfirmationTarget(targets, `${plan.targetSheet}!${plan.targetRange}`);
+    }
+
+    if (typeof plan.sourceSheet === "string" && typeof plan.sourceRange === "string") {
+      addNormalizedConfirmationTarget(targets, `${plan.sourceSheet}!${plan.sourceRange}`);
+    }
+
+    if (Array.isArray(plan.steps)) {
+      plan.steps.forEach((step) => {
+        if (step && step.plan) {
+          collectPlanConfirmationTargets(step.plan, targets);
+        }
+      });
+    }
+  }
+
+  function extractPromptConfirmationTargets(prompt) {
+    const targets = new Set([
+      ...extractQuotedConfirmationTargets(prompt),
+      ...extractWorkbookSheetConfirmationTargets(prompt)
+    ]);
+    const normalizedPrompt = String(prompt || "");
+
+    Array.from(normalizedPrompt.matchAll(/\b[A-Za-z0-9_ ]+!\$?[A-Za-z]{1,3}\$?\d+(?:\:\$?[A-Za-z]{1,3}\$?\d+)?\b/g))
+      .forEach((match) => addNormalizedConfirmationTarget(targets, match[0]));
+
+    Array.from(normalizedPrompt.matchAll(/\b\$?[A-Za-z]{1,3}\$?\d+(?:\:\$?[A-Za-z]{1,3}\$?\d+)?\b/g))
+      .forEach((match) => addNormalizedConfirmationTarget(targets, match[0]));
+
+    return Array.from(targets);
+  }
+
+  function promptMatchesPendingWritePlan(prompt, response) {
+    if (!isTypedConfirmationPrompt(prompt) || !response || !isWritePlanResponse(response) || !getRequiresConfirmation(response)) {
+      return false;
+    }
+
+    const hintedTargets = extractPromptConfirmationTargets(prompt);
+    if (hintedTargets.length === 0) {
+      return true;
+    }
+
+    const expectedTargets = new Set();
+    collectPlanConfirmationTargets(response.data, expectedTargets);
+
+    if (expectedTargets.size === 0) {
+      return true;
+    }
+
+    return hintedTargets.some((target) => expectedTargets.has(target));
+  }
+
+  function getLatestPendingWritePlanMessage(prompt) {
+    for (let index = state.messages.length - 1; index >= 0; index -= 1) {
+      const message = state.messages[index];
+      if (
+        message &&
+        message.role === "assistant" &&
+        message.requestId &&
+        message.runId &&
+        message.response &&
+        promptMatchesPendingWritePlan(prompt, message.response)
+      ) {
+        return message;
+      }
+    }
+
+    return null;
+  }
+
+  async function executeWritePlanMessage(message) {
+    if (!message || !message.requestId || !message.runId || !message.response || !isWritePlanResponse(message.response)) {
+      return false;
+    }
+
+    try {
+      if (message.pendingCompletion) {
+        await callGatewayJson("/api/writeback/complete", {
+          method: "post",
+          headers: { "content-type": "application/json" },
+          body: message.pendingCompletion
+        });
+        applyWritebackResultToMessage(message, message.pendingCompletion.result);
+        renderMessages();
+        return true;
+      }
+
+      const workbookSessionKey = await callServer("getWorkbookSessionKey");
+      const approvalRequest = buildWriteApprovalRequest({
+        requestId: message.requestId,
+        runId: message.runId,
+        plan: message.response.data,
+        workbookSessionKey: workbookSessionKey
+      });
+      if (!approvalRequest) {
+        message.statusLine = "Destructive write-back cancelled.";
+        renderMessages();
+        return true;
+      }
+
+      const approval = await callGatewayJson("/api/writeback/approve", {
+        method: "post",
+        headers: { "content-type": "application/json" },
+        body: approvalRequest
+      });
+
+      const result = await callServer("applyWritePlan", {
+        requestId: message.requestId,
+        runId: message.runId,
+        approvalToken: approval.approvalToken,
+        executionId: approval.executionId,
+        plan: approvalRequest.plan
+      });
+      const gatewayResult = prepareGatewayWritebackResult(
+        result,
+        approval.executionId,
+        workbookSessionKey
+      );
+      message.pendingCompletion = buildPendingWritebackCompletionRequest(
+        message,
+        approval,
+        gatewayResult
+      );
+
+      await callGatewayJson("/api/writeback/complete", {
+        method: "post",
+        headers: { "content-type": "application/json" },
+        body: message.pendingCompletion
+      });
+
+      applyWritebackResultToMessage(message, gatewayResult);
+    } catch (error) {
+      message.statusLine = message.pendingCompletion
+        ? getPendingCompletionRetryStatus()
+        : sanitizeHostExecutionError(error, "Write-back failed.");
+    }
+
+    renderMessages();
+    return true;
+  }
+
+  function getResponseWarnings(response) {
+    const warnings = (response.warnings || []).slice();
+    if (response.data && Array.isArray(response.data.warnings)) {
+      warnings.push(...response.data.warnings);
+    }
+    return warnings;
+  }
+
+  function getResponseConfidence(response) {
+    return response.data && typeof response.data.confidence === "number"
+      ? response.data.confidence
+      : undefined;
+  }
+
+  function getRequiresConfirmation(response) {
+    if (!response) {
+      return false;
+    }
+
+    if (response.type === "formula") {
+      return Boolean(response.data.requiresConfirmation);
+    }
+
+    if (response.type === "analysis_report_plan") {
+      return response.data.outputMode === "materialize_report";
+    }
+
+    if (response.type === "pivot_table_plan" || response.type === "chart_plan") {
+      return isWritePlanResponse(response) && Boolean(response.data.requiresConfirmation);
+    }
+
+    if (
+      response.type === "workbook_structure_update" ||
+      response.type === "sheet_structure_update" ||
+      response.type === "range_sort_plan" ||
+      response.type === "range_filter_plan" ||
+      response.type === "range_format_update" ||
+      response.type === "conditional_format_plan" ||
+      response.type === "data_validation_plan" ||
+      response.type === "named_range_update" ||
+      response.type === "range_transfer_plan" ||
+      response.type === "data_cleanup_plan" ||
+      response.type === "external_data_plan" ||
+      response.type === "composite_plan" ||
+      response.type === "sheet_update" ||
+      response.type === "sheet_import_plan"
+    ) {
+      return Boolean(response.data.requiresConfirmation);
+    }
+
+    return false;
+  }
+
+  function getResponseMetaLine(response) {
+    const parts = [];
+
+    if (Array.isArray(response.skillsUsed) && response.skillsUsed.length > 0) {
+      parts.push(`skills ${response.skillsUsed.join(", ")}`);
+    }
+
+    if (response.downstreamProvider && response.downstreamProvider.label) {
+      parts.push(
+        response.downstreamProvider.model
+          ? `provider ${response.downstreamProvider.label}/${response.downstreamProvider.model}`
+          : `provider ${response.downstreamProvider.label}`
+      );
+    }
+
+    const confidence = getResponseConfidence(response);
+    if (typeof confidence === "number" && response.ui && response.ui.showConfidence) {
+      parts.push(`confidence ${Math.round(confidence * 100)}%`);
+    }
+
+    if (response.ui && response.ui.showRequiresConfirmation && getRequiresConfirmation(response)) {
+      parts.push("confirmation required");
+    }
+
+    if (response.data && response.data.extractionMode) {
+      parts.push(`extraction ${response.data.extractionMode}`);
+    }
+
+    return parts.join(" • ");
+  }
+
+  function requiresDestructiveWriteApproval(plan) {
+    if (!plan || typeof plan !== "object") {
+      return false;
+    }
+
+    if (plan.confirmationLevel === "destructive") {
+      return true;
+    }
+
+    if (Array.isArray(plan.steps)) {
+      return plan.steps.some((step) => step && step.plan && step.plan.confirmationLevel === "destructive");
+    }
+
+    return false;
+  }
+
+  function getWriteApprovalConfirmFunction() {
+    if (typeof window !== "undefined" && typeof window.confirm === "function") {
+      return window.confirm.bind(window);
+    }
+
+    if (typeof globalThis !== "undefined" && typeof globalThis.confirm === "function") {
+      return globalThis.confirm.bind(globalThis);
+    }
+
+    throw new Error("Destructive confirmation is unavailable in this host.");
+  }
+
+  function getDestructiveWriteApprovalMessage(plan) {
+    if (plan && typeof plan === "object" && "sourceSheet" in plan && "sourceRange" in plan) {
+      return [
+        "This transfer is destructive and requires a second confirmation.",
+        "",
+        `Move ${plan.sourceSheet}!${plan.sourceRange} to ${plan.targetSheet}!${plan.targetRange}?`,
+        "",
+        "Select OK to approve and execute this destructive plan."
+      ].join("\n");
+    }
+
+    if (plan && typeof plan === "object" && "targetSheet" in plan && "targetRange" in plan) {
+      return [
+        "This cleanup is destructive and requires a second confirmation.",
+        "",
+        `Apply ${plan.operation} to ${plan.targetSheet}!${plan.targetRange}?`,
+        "",
+        "Select OK to approve and execute this destructive plan."
+      ].join("\n");
+    }
+
+    return [
+      "This write-back is destructive and requires a second confirmation.",
+      "",
+      "Select OK to approve and execute this destructive plan."
+    ].join("\n");
+  }
+
+  function buildWriteApprovalRequest(input) {
+    const resolvedPlan = isMaterializedAnalysisReportPlan(input.plan)
+      ? resolveMaterializedAnalysisReportPlan(input.plan)
+      : input.plan;
+    const workbookSessionKey = typeof input.workbookSessionKey === "string" && input.workbookSessionKey.trim()
+      ? input.workbookSessionKey.trim()
+      : undefined;
+    const destructiveConfirmation = requiresDestructiveWriteApproval(resolvedPlan)
+      ? (getWriteApprovalConfirmFunction()(getDestructiveWriteApprovalMessage(resolvedPlan))
+        ? { confirmed: true }
+        : null)
+      : undefined;
+
+    if (requiresDestructiveWriteApproval(resolvedPlan) && !destructiveConfirmation) {
+      return null;
+    }
+
+    return destructiveConfirmation
+      ? {
+          requestId: input.requestId,
+          runId: input.runId,
+          ...(workbookSessionKey ? { workbookSessionKey: workbookSessionKey } : {}),
+          plan: resolvedPlan,
+          destructiveConfirmation
+        }
+      : {
+          requestId: input.requestId,
+          runId: input.runId,
+          ...(workbookSessionKey ? { workbookSessionKey: workbookSessionKey } : {}),
+          plan: resolvedPlan
+        };
+  }
+
+  function getGatewayBaseUrl() {
+    return state.runtimeConfig && state.runtimeConfig.gatewayBaseUrl
+      ? state.runtimeConfig.gatewayBaseUrl
+      : createDefaultRuntimeConfig().gatewayBaseUrl;
+  }
+
+  async function dryRunCompositePlan(input) {
+    const workbookSessionKey = await callServer("getWorkbookSessionKey");
+    return callGatewayJson("/api/execution/dry-run", {
+      method: "post",
+      headers: { "content-type": "application/json" },
+      body: {
+        ...input,
+        workbookSessionKey
+      }
+    });
+  }
+
+  async function listExecutionHistory(input = {}) {
+    const workbookSessionKey = await callServer("getWorkbookSessionKey");
+    const params = [`workbookSessionKey=${encodeURIComponent(workbookSessionKey)}`];
+    if (typeof input.limit === "number") {
+      params.push(`limit=${encodeURIComponent(String(input.limit))}`);
+    }
+    if (input.cursor) {
+      params.push(`cursor=${encodeURIComponent(input.cursor)}`);
+    }
+
+    return callGatewayJson(`/api/execution/history?${params.join("&")}`);
+  }
+
+  async function undoExecution(executionId) {
+    const workbookSessionKey = await callServer("getWorkbookSessionKey");
+    const snapshot = getLocalExecutionSnapshot(workbookSessionKey, executionId);
+    if (!snapshot) {
+      throw new Error("That history entry no longer has an exact undo snapshot in this sheet session.");
+    }
+
+    await callServer("validateExecutionCellSnapshot", {
+      targetSheet: snapshot.targetSheet,
+      targetRange: snapshot.targetRange,
+      cells: snapshot.beforeCells
+    });
+    assertLocalExecutionSnapshotStoreWritable(workbookSessionKey, snapshot, "undo");
+    const result = await callGatewayJson("/api/execution/undo", {
+      method: "post",
+      headers: { "content-type": "application/json" },
+      body: {
+        executionId,
+        requestId: createRequestId(),
+        workbookSessionKey
+      }
+    });
+    await callServer("applyExecutionCellSnapshot", {
+      targetSheet: snapshot.targetSheet,
+      targetRange: snapshot.targetRange,
+      cells: snapshot.beforeCells
+    });
+    if (result && result.executionId) {
+      linkLocalExecutionSnapshot(workbookSessionKey, result.executionId, executionId);
+    }
+    return result;
+  }
+
+  async function redoExecution(executionId) {
+    const workbookSessionKey = await callServer("getWorkbookSessionKey");
+    const snapshot = getLocalExecutionSnapshot(workbookSessionKey, executionId);
+    if (!snapshot) {
+      throw new Error("That history entry no longer has an exact redo snapshot in this sheet session.");
+    }
+
+    await callServer("validateExecutionCellSnapshot", {
+      targetSheet: snapshot.targetSheet,
+      targetRange: snapshot.targetRange,
+      cells: snapshot.afterCells
+    });
+    assertLocalExecutionSnapshotStoreWritable(workbookSessionKey, snapshot, "redo");
+    const result = await callGatewayJson("/api/execution/redo", {
+      method: "post",
+      headers: { "content-type": "application/json" },
+      body: {
+        executionId,
+        requestId: createRequestId(),
+        workbookSessionKey
+      }
+    });
+    await callServer("applyExecutionCellSnapshot", {
+      targetSheet: snapshot.targetSheet,
+      targetRange: snapshot.targetRange,
+      cells: snapshot.afterCells
+    });
+    if (result && result.executionId) {
+      linkLocalExecutionSnapshot(workbookSessionKey, result.executionId, executionId);
+    }
+    return result;
+  }
+
+  function getExecutionShortcutMode(prompt) {
+    if (UNDO_PROMPT_PATTERN.test(prompt)) {
+      return "undo";
+    }
+
+    if (REDO_PROMPT_PATTERN.test(prompt)) {
+      return "redo";
+    }
+
+    return null;
+  }
+
+  function getLatestHistoryExecutionId(entries, mode) {
+    if (!Array.isArray(entries)) {
+      return null;
+    }
+
+    const matchingEntry = entries.find((entry) => mode === "undo"
+      ? entry?.undoEligible === true
+      : entry?.redoEligible === true);
+
+    return typeof matchingEntry?.executionId === "string" && matchingEntry.executionId.trim()
+      ? matchingEntry.executionId
+      : null;
+  }
+
+  function buildUnderSpecifiedFollowUpMessage(messages) {
+    const previousAssistantMessage = [...(messages || [])]
+      .reverse()
+      .find((message) => message?.role === "assistant");
+
+    const followUpSuggestions = previousAssistantMessage?.response
+      ? getFollowUpSuggestions(previousAssistantMessage.response)
+      : [];
+
+    if (followUpSuggestions.length > 0) {
+      return `I still need a concrete next step, not just “yes”. Try one of these: ${followUpSuggestions.join(" | ")}`;
+    }
+
+    const recoveryAction = previousAssistantMessage?.response?.type === "error" &&
+      typeof previousAssistantMessage.response?.data?.userAction === "string"
+      ? previousAssistantMessage.response.data.userAction.trim()
+      : "";
+
+    if (recoveryAction) {
+      return `I still need a concrete next step, not just “yes”. ${recoveryAction}`;
+    }
+
+    return "I still need the exact range, cell, sheet, or action you want me to apply.";
+  }
+
+  async function handleExecutionShortcut(mode, assistantMessage) {
+    assistantMessage.statusLine = mode === "undo"
+      ? "Looking up the latest reversible write..."
+      : "Looking up the latest redo entry...";
+    renderMessages();
+
+    const history = await listExecutionHistory({ limit: EXECUTION_HISTORY_SHORTCUT_LIMIT });
+    const executionId = getLatestHistoryExecutionId(history?.entries, mode);
+
+    if (!executionId) {
+      throw new Error(mode === "undo"
+        ? "I can’t perform an exact undo for the latest write in this workbook session."
+        : "I can’t perform an exact redo for the latest write in this workbook session.");
+    }
+
+    const result = mode === "undo"
+      ? await undoExecution(executionId)
+      : await redoExecution(executionId);
+
+    applyWritebackResultToMessage(assistantMessage, result);
+  }
+
+  const ANALYSIS_OUTPUT_MODES = new Set([
+    "chat_only",
+    "materialize_report"
+  ]);
+
+  const CHART_TYPES = new Set([
+    "bar",
+    "column",
+    "stacked_bar",
+    "stacked_column",
+    "line",
+    "area",
+    "pie",
+    "scatter"
+  ]);
+
+  function isCompositePlan(plan) {
+    return Boolean(
+      plan &&
+      Array.isArray(plan.steps) &&
+      plan.steps.length > 0 &&
+      typeof plan.explanation === "string"
+    );
+  }
+
+  function isPivotTablePlanLike(plan) {
+    return Boolean(
+      plan &&
+      typeof plan.sourceSheet === "string" &&
+      typeof plan.sourceRange === "string" &&
+      typeof plan.targetSheet === "string" &&
+      typeof plan.targetRange === "string" &&
+      Array.isArray(plan.rowGroups) &&
+      Array.isArray(plan.valueAggregations)
+    );
+  }
+
+  function isChartPlanLike(plan) {
+    return Boolean(
+      plan &&
+      typeof plan.sourceSheet === "string" &&
+      typeof plan.sourceRange === "string" &&
+      typeof plan.targetSheet === "string" &&
+      typeof plan.targetRange === "string" &&
+      typeof plan.chartType === "string" &&
+      Array.isArray(plan.series)
+    );
+  }
+
+  function isLikelyReversibleCompositeStep(step) {
+    if (!step || !step.plan || isPivotTablePlanLike(step.plan) || isChartPlanLike(step.plan)) {
+      return false;
+    }
+
+    // Wave 6 should only advertise reversibility when an exact inverse is known.
+    return false;
+  }
+
+  function buildCompositeStepSummary(step) {
+    if (step && step.plan && typeof step.plan.explanation === "string" && step.plan.explanation.trim().length > 0) {
+      return step.plan.explanation;
+    }
+
+    if (step && step.plan && typeof step.plan.operation === "string" && step.plan.operation.trim().length > 0) {
+      return `Execute ${step.plan.operation}.`;
+    }
+
+    return `Execute ${step && step.stepId ? step.stepId : "workflow step"}.`;
+  }
+
+  function buildCompositeStepPreview(step) {
+    return {
+      stepId: step.stepId,
+      dependsOn: step.dependsOn || [],
+      continueOnError: Boolean(step.continueOnError),
+      destructive: step && step.plan && step.plan.confirmationLevel === "destructive",
+      reversible: isLikelyReversibleCompositeStep(step),
+      summary: buildCompositeStepSummary(step)
+    };
+  }
+
+  function getCompositePreviewSummary(plan) {
+    return `Will run ${plan.steps.length} workflow step${plan.steps.length === 1 ? "" : "s"}.`;
+  }
+
+  function joinList(values) {
+    return Array.isArray(values) && values.length > 0 ? values.join(", ") : "";
+  }
+
+  function padMatrixRows(rows) {
+    const width = Math.max(1, ...rows.map((row) => row.length));
+    return rows.map((row) => Array.from({ length: width }, (_, index) => row[index] ?? ""));
+  }
+
+  function parseA1CellReference(reference) {
+    const match = String(reference || "").trim().toUpperCase().match(/^([A-Z]+)(\d+)$/);
+    if (!match) {
+      throw new Error(`Unsupported A1 reference: ${reference}`);
+    }
+
+    let column = 0;
+    for (const character of match[1]) {
+      column = (column * 26) + (character.charCodeAt(0) - 64);
+    }
+
+    return {
+      row: Number(match[2]),
+      column
+    };
+  }
+
+  function columnNumberToLetters(columnNumber) {
+    let value = Number(columnNumber);
+    let letters = "";
+
+    while (value > 0) {
+      const remainder = (value - 1) % 26;
+      letters = String.fromCharCode(65 + remainder) + letters;
+      value = Math.floor((value - 1) / 26);
+    }
+
+    return letters;
+  }
+
+  function isAnalysisReportPlan(plan) {
+    return Boolean(
+      plan &&
+      typeof plan.sourceSheet === "string" &&
+      typeof plan.sourceRange === "string" &&
+      ANALYSIS_OUTPUT_MODES.has(plan.outputMode) &&
+      Array.isArray(plan.sections) &&
+      plan.sections.length > 0
+    );
+  }
+
+  function isMaterializedAnalysisReportPlan(plan) {
+    return isAnalysisReportPlan(plan) &&
+      plan.outputMode === "materialize_report" &&
+      typeof plan.targetSheet === "string" &&
+      typeof plan.targetRange === "string";
+  }
+
+  function isPivotTablePlan(plan) {
+    return Boolean(
+      plan &&
+      typeof plan.sourceSheet === "string" &&
+      typeof plan.sourceRange === "string" &&
+      typeof plan.targetSheet === "string" &&
+      typeof plan.targetRange === "string" &&
+      Array.isArray(plan.rowGroups) &&
+      plan.rowGroups.length > 0 &&
+      Array.isArray(plan.valueAggregations) &&
+      plan.valueAggregations.length > 0
+    );
+  }
+
+  function isChartPlan(plan) {
+    return Boolean(
+      plan &&
+      typeof plan.sourceSheet === "string" &&
+      typeof plan.sourceRange === "string" &&
+      typeof plan.targetSheet === "string" &&
+      typeof plan.targetRange === "string" &&
+      CHART_TYPES.has(plan.chartType) &&
+      Array.isArray(plan.series) &&
+      plan.series.length > 0
+    );
+  }
+
+  function buildAnalysisReportMatrix(plan) {
+    const rows = [
+      ["Analysis report"],
+      ["Source sheet", plan.sourceSheet],
+      ["Source range", plan.sourceRange],
+      ["Section", "Title", "Summary", "Source ranges"],
+      ...plan.sections.map((section) => [
+        section.type,
+        section.title,
+        section.summary,
+        joinList(section.sourceRanges)
+      ])
+    ];
+
+    return padMatrixRows(rows);
+  }
+
+  function resolveAnalysisReportTargetRange(plan) {
+    const matrix = buildAnalysisReportMatrix(plan);
+    const anchor = parseA1CellReference(String(plan.targetRange || "").replaceAll("$", "").split(":")[0]);
+    const endRow = anchor.row + matrix.length - 1;
+    const endColumn = anchor.column + (matrix[0]?.length || 1) - 1;
+    const startCell = `${columnNumberToLetters(anchor.column)}${anchor.row}`;
+    const endCell = `${columnNumberToLetters(endColumn)}${endRow}`;
+
+    return startCell === endCell ? startCell : `${startCell}:${endCell}`;
+  }
+
+  function normalizeAnalysisReportAffectedRanges(plan, resolvedTargetRange) {
+    const resolvedTargetRef = `${plan.targetSheet}!${resolvedTargetRange}`;
+    const anchorTargetRef = `${plan.targetSheet}!${plan.targetRange}`;
+    const normalizedRanges = Array.isArray(plan.affectedRanges)
+      ? plan.affectedRanges.map((range) => range === anchorTargetRef ? resolvedTargetRef : range)
+      : [];
+
+    if (!normalizedRanges.includes(resolvedTargetRef)) {
+      normalizedRanges.push(resolvedTargetRef);
+    }
+
+    return normalizedRanges;
+  }
+
+  function resolveMaterializedAnalysisReportPlan(plan) {
+    if (!isMaterializedAnalysisReportPlan(plan)) {
+      return plan;
+    }
+
+    const resolvedTargetRange = resolveAnalysisReportTargetRange(plan);
+
+    return {
+      ...plan,
+      targetRange: resolvedTargetRange,
+      affectedRanges: normalizeAnalysisReportAffectedRanges(plan, resolvedTargetRange)
+    };
+  }
+
+  function getAnalysisReportPreviewSummary(plan) {
+    if (plan.outputMode === "chat_only") {
+      return `Will answer with a chat-only analysis of ${plan.sourceSheet}!${plan.sourceRange}.`;
+    }
+
+    return `Will materialize an analysis report on ${plan.targetSheet}!${plan.targetRange}.`;
+  }
+
+  function getPivotTablePreviewSummary(plan) {
+    return `Will create a pivot table on ${plan.targetSheet}!${plan.targetRange}.`;
+  }
+
+  function getChartPreviewSummary(plan) {
+    return `Will create a ${plan.chartType} chart on ${plan.targetSheet}!${plan.targetRange}.`;
+  }
+
+  function isSupportedGoogleSheetsChartType(chartType) {
+    return [
+      "bar",
+      "column",
+      "stacked_bar",
+      "stacked_column",
+      "line",
+      "area",
+      "pie",
+      "scatter"
+    ].includes(chartType);
+  }
+
+  function isSupportedGoogleSheetsChartLegendPosition(legendPosition) {
+    return ["bottom", "left", "right", "top", "none", "hidden"].includes(legendPosition);
+  }
+
+  function isExactSafeChartSeriesLabel(series) {
+    if (!series || typeof series !== "object") {
+      return true;
+    }
+
+    if (series.label === undefined || series.label === null || String(series.label).trim().length === 0) {
+      return true;
+    }
+
+    return String(series.label).trim() === String(series.field || "").trim();
+  }
+
+  function formatProofLine(response) {
+    return [
+      "Processed by Hermes",
+      `requestId ${response.requestId}`,
+      `hermesRunId ${response.hermesRunId}`,
+      `service ${response.serviceLabel}`,
+      `environment ${response.environmentLabel}`,
+      `${response.durationMs}ms`
+    ].join(" • ");
+  }
+
+  function getFollowUpSuggestions(response) {
+    return response.type === "chat"
+      ? response.data.followUpSuggestions || []
+      : [];
+  }
+
+  function isPreviewSupportCheckedWritePlanType(responseType) {
+    return responseType === "pivot_table_plan" ||
+      responseType === "chart_plan" ||
+      responseType === "conditional_format_plan" ||
+      responseType === "range_filter_plan" ||
+      responseType === "data_validation_plan" ||
+      responseType === "named_range_update" ||
+      responseType === "range_transfer_plan" ||
+      responseType === "data_cleanup_plan" ||
+      responseType === "external_data_plan";
+  }
+
+  function getCompositePreviewSupportErrors(steps) {
+    return (steps || [])
+      .map((step) => ({
+        stepId: step && step.stepId,
+        supportError: (step && step.supportError) || ((step && step.plan) ? getGoogleSheetsPlanSupportError(step.plan) : "")
+      }))
+      .filter((step) => typeof step.supportError === "string" && step.supportError.trim().length > 0);
+  }
+
+  function inferGoogleSheetsPreviewSupportKind(preview) {
+    if (!preview || typeof preview !== "object") {
+      return "";
+    }
+
+    if (typeof preview.kind === "string" && preview.kind.trim().length > 0) {
+      return preview.kind;
+    }
+
+    if (typeof preview.chartType === "string" && Array.isArray(preview.series)) {
+      return "chart_plan";
+    }
+
+    if (Array.isArray(preview.rowGroups) && Array.isArray(preview.valueAggregations)) {
+      return "pivot_table_plan";
+    }
+
+    if (typeof preview.managementMode === "string") {
+      return "conditional_format_plan";
+    }
+
+    if (typeof preview.ruleType === "string" && typeof preview.invalidDataBehavior === "string") {
+      return "data_validation_plan";
+    }
+
+    if (typeof preview.targetSheet === "string" &&
+      typeof preview.targetRange === "string" &&
+      Array.isArray(preview.conditions)) {
+      return "range_filter_plan";
+    }
+
+    if (typeof preview.sourceSheet === "string" &&
+      typeof preview.sourceRange === "string" &&
+      typeof preview.pasteMode === "string") {
+      return "range_transfer_plan";
+    }
+
+    if (typeof preview.sourceType === "string" &&
+      typeof preview.provider === "string" &&
+      typeof preview.formula === "string" &&
+      typeof preview.targetSheet === "string" &&
+      typeof preview.targetRange === "string") {
+      return "external_data_plan";
+    }
+
+    if (typeof preview.operation === "string" &&
+      [
+        "trim_whitespace",
+        "remove_blank_rows",
+        "remove_duplicate_rows",
+        "normalize_case",
+        "split_column",
+        "join_columns",
+        "fill_down",
+        "standardize_format"
+      ].includes(preview.operation)) {
+      return "data_cleanup_plan";
+    }
+
+    if (typeof preview.scope === "string" && typeof preview.name === "string") {
+      return "named_range_update";
+    }
+
+    return "";
+  }
+
+  function normalizeFilterPreviewColumnRef(columnRef) {
+    if (Number.isInteger(columnRef)) {
+      return `#${columnRef}`;
+    }
+
+    if (typeof columnRef !== "string") {
+      return "";
+    }
+
+    const trimmed = columnRef.trim();
+    if (!trimmed) {
+      return "";
+    }
+
+    if (/^\d+$/.test(trimmed)) {
+      return `#${Number(trimmed)}`;
+    }
+
+    return `s:${trimmed.toLocaleLowerCase()}`;
+  }
+
+  function hasRepeatedFilterPreviewColumns(conditions) {
+    const seen = new Set();
+
+    for (const condition of conditions || []) {
+      const normalizedColumnRef = normalizeFilterPreviewColumnRef(condition && condition.columnRef);
+      if (!normalizedColumnRef) {
+        continue;
+      }
+
+      if (seen.has(normalizedColumnRef)) {
+        return true;
+      }
+
+      seen.add(normalizedColumnRef);
+    }
+
+    return false;
+  }
+
+  function isWritePlanResponse(response) {
+    if (!response) {
+      return false;
+    }
+
+    if (response.type === "analysis_report_plan") {
+      return response.data.outputMode === "materialize_report";
+    }
+
+    if (isPreviewSupportCheckedWritePlanType(response.type)) {
+      if (!response.data || typeof response.data !== "object") {
+        return true;
+      }
+      return !getGoogleSheetsPlanSupportError(getStructuredPreview(response));
+    }
+
+    if (response.type === "composite_plan") {
+      if (!response.data || typeof response.data !== "object") {
+        return true;
+      }
+      return Array.isArray(response.data.steps) &&
+        getCompositePreviewSupportErrors(response.data.steps).length === 0;
+    }
+
+    return response.type === "workbook_structure_update" ||
+      response.type === "sheet_structure_update" ||
+      response.type === "range_sort_plan" ||
+      response.type === "range_filter_plan" ||
+      response.type === "range_format_update" ||
+      response.type === "conditional_format_plan" ||
+      response.type === "data_validation_plan" ||
+      response.type === "named_range_update" ||
+      response.type === "range_transfer_plan" ||
+      response.type === "data_cleanup_plan" ||
+      response.type === "sheet_update" ||
+      response.type === "sheet_import_plan";
+  }
+
+  function buildWriteMatrix(plan) {
+    if (Array.isArray(plan.headers)) {
+      return [plan.headers].concat(plan.values);
+    }
+
+    if (Array.isArray(plan.values)) {
+      return plan.values;
+    }
+
+    if (Array.isArray(plan.formulas)) {
+      return plan.formulas;
+    }
+
+    if (Array.isArray(plan.notes)) {
+      return plan.notes;
+    }
+
+    return [];
+  }
+
+  function formatWorkbookPositionLabel(position) {
+    if (position === undefined) {
+      return "";
+    }
+
+    if (position === "start" || position === "end") {
+      return ` • ${position}`;
+    }
+
+    return ` • index ${position}`;
+  }
+
+  function formatRangeFormatFields(format) {
+    return Object.entries(format || {})
+      .filter((entry) => entry[1] !== undefined)
+      .map((entry) => `${entry[0]}=${entry[1]}`)
+      .join(" • ");
+  }
+
+  function formatStructureIndexSpan(label, startIndex, count) {
+    if (!Number.isInteger(startIndex) || !Number.isInteger(count) || count < 1) {
+      return "";
+    }
+
+    const start = startIndex + 1;
+    const end = startIndex + count;
+    return `${label} ${start}${end > start ? `-${end}` : ""}`;
+  }
+
+  function formatSheetStructureDetail(preview) {
+    switch (preview.operation) {
+      case "insert_rows":
+      case "delete_rows":
+      case "hide_rows":
+      case "unhide_rows":
+      case "group_rows":
+      case "ungroup_rows":
+        return formatStructureIndexSpan("Rows", preview.startIndex, preview.count);
+      case "insert_columns":
+      case "delete_columns":
+      case "hide_columns":
+      case "unhide_columns":
+      case "group_columns":
+      case "ungroup_columns":
+        return formatStructureIndexSpan("Columns", preview.startIndex, preview.count);
+      case "freeze_panes":
+      case "unfreeze_panes":
+        return `Frozen rows ${preview.frozenRows || 0} • Frozen columns ${preview.frozenColumns || 0}`;
+      case "set_sheet_tab_color":
+        return preview.color ? `Tab color ${preview.color}` : "Tab color default";
+      case "merge_cells":
+      case "unmerge_cells":
+      case "autofit_rows":
+      case "autofit_columns":
+        return preview.targetRange ? `Range ${preview.targetRange}` : "";
+      default:
+        return "";
+    }
+  }
+
+  function formatSortKeys(keys) {
+    return (keys || []).map((key) => {
+      const direction = key && key.direction === "desc" ? "desc" : "asc";
+      return `${key.columnRef} ${direction}`;
+    }).join(", ");
+  }
+
+  function formatFilterConditionValue(value) {
+    if (value === null || value === undefined || value === "") {
+      return "";
+    }
+
+    return ` ${String(value)}`;
+  }
+
+  function formatFilterCondition(condition) {
+    const columnRef = condition && condition.columnRef !== undefined
+      ? String(condition.columnRef)
+      : "?";
+
+    return `${columnRef} ${condition.operator}${formatFilterConditionValue(condition.value)}`;
+  }
+
+  function formatFilterConditions(conditions) {
+    return (conditions || []).map((condition) => formatFilterCondition(condition)).join("; ");
+  }
+
+  function formatClearExistingFiltersState(clearExistingFilters) {
+    return clearExistingFilters ? "Clear existing filters first" : "Preserve existing filters";
+  }
+
+  function getDataValidationStatusSummary(plan) {
+    if (plan && plan.targetSheet && plan.targetRange) {
+      return `Applied validation to ${plan.targetSheet}!${plan.targetRange}.`;
+    }
+
+    return "Applied validation.";
+  }
+
+  function getNamedRangeStatusSummary(plan) {
+    if (plan && plan.operation === "delete") {
+      return `Deleted named range ${plan.name}.`;
+    }
+
+    if (plan && plan.operation === "rename" && plan.newName) {
+      return `Renamed named range ${plan.name} to ${plan.newName}.`;
+    }
+
+    if (plan && plan.operation === "create" && plan.targetSheet && plan.targetRange) {
+      return `Created named range ${plan.name} at ${plan.targetSheet}!${plan.targetRange}.`;
+    }
+
+    if (plan && plan.targetSheet && plan.targetRange) {
+      return `Retargeted ${plan.name} to ${plan.targetSheet}!${plan.targetRange}.`;
+    }
+
+    if (plan && plan.name) {
+      return `Updated named range ${plan.name}.`;
+    }
+
+    return "Updated named range.";
+  }
+
+  function getDataValidationPreviewSummary(plan) {
+    if (plan && plan.targetSheet && plan.targetRange) {
+      return `Will validate ${plan.targetSheet}!${plan.targetRange}.`;
+    }
+
+    return "Will apply validation.";
+  }
+
+  function getConditionalFormatPreviewSummary(plan) {
+    if (!plan || !plan.targetSheet || !plan.targetRange) {
+      return "Will update conditional formatting.";
+    }
+
+    if (
+      plan.managementMode !== "add" &&
+      plan.managementMode !== "replace_all_on_target" &&
+      plan.managementMode !== "clear_on_target"
+    ) {
+      return "Will update conditional formatting.";
+    }
+
+    switch (plan.managementMode) {
+      case "add":
+        return `Will add conditional formatting on ${plan.targetSheet}!${plan.targetRange}.`;
+      case "replace_all_on_target":
+        return `Will replace all conditional formatting on ${plan.targetSheet}!${plan.targetRange}.`;
+      case "clear_on_target":
+        return `Will clear conditional formatting on ${plan.targetSheet}!${plan.targetRange}.`;
+      default:
+        return "Will update conditional formatting.";
+    }
+  }
+
+  function getNamedRangePreviewSummary(plan) {
+    if (!plan) {
+      return "Will update the named range.";
+    }
+
+    switch (plan.operation) {
+      case "delete":
+        return `Will delete named range ${plan.name}.`;
+      case "rename":
+        return plan.newName
+          ? `Will rename named range ${plan.name} to ${plan.newName}.`
+          : `Will rename named range ${plan.name}.`;
+      case "create":
+        return plan.targetSheet && plan.targetRange
+          ? `Will create named range ${plan.name} at ${plan.targetSheet}!${plan.targetRange}.`
+          : `Will create named range ${plan.name}.`;
+      case "retarget":
+        return plan.targetSheet && plan.targetRange
+          ? `Will retarget ${plan.name} to ${plan.targetSheet}!${plan.targetRange}.`
+          : `Will retarget named range ${plan.name}.`;
+      default:
+        return `Will update named range ${plan.name}.`;
+    }
+  }
+
+  function parseA1CellReference(reference) {
+    const match = String(reference || "").trim().toUpperCase().match(/^([A-Z]+)(\d+)$/);
+    if (!match) {
+      return null;
+    }
+
+    const [, columnLetters, rowText] = match;
+    let column = 0;
+    for (const character of columnLetters) {
+      column = (column * 26) + (character.charCodeAt(0) - 64);
+    }
+
+    return {
+      row: Number(rowText),
+      column
+    };
+  }
+
+  function parseA1RangeReference(reference) {
+    const normalized = String(reference || "").replaceAll("$", "").trim().toUpperCase();
+    const [startRef, endRef = startRef] = normalized.split(":");
+    const start = parseA1CellReference(startRef);
+    const end = parseA1CellReference(endRef);
+
+    if (!start || !end) {
+      return null;
+    }
+
+    return {
+      startRow: Math.min(start.row, end.row),
+      endRow: Math.max(start.row, end.row),
+      startColumn: Math.min(start.column, end.column),
+      endColumn: Math.max(start.column, end.column)
+    };
+  }
+
+  function isSingleCellA1Anchor(reference) {
+    const bounds = parseA1RangeReference(reference);
+    return Boolean(
+      bounds &&
+      bounds.startRow === bounds.endRow &&
+      bounds.startColumn === bounds.endColumn
+    );
+  }
+
+  function rangesOverlap(left, right) {
+    return !(left.endRow < right.startRow ||
+      right.endRow < left.startRow ||
+      left.endColumn < right.startColumn ||
+      right.endColumn < left.startColumn);
+  }
+
+  function deriveTransferTargetPreviewBounds(plan) {
+    const targetBounds = parseA1RangeReference(plan?.targetRange);
+    const sourceBounds = parseA1RangeReference(plan?.sourceRange);
+
+    if (!targetBounds || !sourceBounds) {
+      return targetBounds;
+    }
+
+    const sourceRowCount = sourceBounds.endRow - sourceBounds.startRow + 1;
+    const sourceColumnCount = sourceBounds.endColumn - sourceBounds.startColumn + 1;
+    const expectedRows = plan?.transpose ? sourceColumnCount : sourceRowCount;
+    const expectedColumns = plan?.transpose ? sourceRowCount : sourceColumnCount;
+    const targetRowCount = targetBounds.endRow - targetBounds.startRow + 1;
+    const targetColumnCount = targetBounds.endColumn - targetBounds.startColumn + 1;
+
+    if (targetRowCount === expectedRows && targetColumnCount === expectedColumns) {
+      return targetBounds;
+    }
+
+    if (targetRowCount === 1 && targetColumnCount === 1) {
+      return {
+        startRow: targetBounds.startRow,
+        endRow: targetBounds.startRow + expectedRows - 1,
+        startColumn: targetBounds.startColumn,
+        endColumn: targetBounds.startColumn + expectedColumns - 1
+      };
+    }
+
+    return targetBounds;
+  }
+
+  function getRangeTransferPreviewSummary(plan) {
+    const source = plan?.sourceSheet && plan?.sourceRange
+      ? `${plan.sourceSheet}!${plan.sourceRange}`
+      : "the source range";
+    const target = plan?.targetSheet && plan?.targetRange
+      ? `${plan.targetSheet}!${plan.targetRange}`
+      : "the target range";
+
+    switch (plan?.operation) {
+      case "copy":
+        return `Will copy ${source} to ${target}.`;
+      case "move":
+        return `Will move ${source} to ${target}.`;
+      case "append":
+        return `Will append ${source} into ${target}.`;
+      default:
+        return `Will transfer ${source} to ${target}.`;
+    }
+  }
+
+  function getDataCleanupPreviewSummary(plan) {
+    const target = plan?.targetSheet && plan?.targetRange
+      ? `${plan.targetSheet}!${plan.targetRange}`
+      : "the target range";
+
+    switch (plan?.operation) {
+      case "trim_whitespace":
+        return `Will trim whitespace in ${target}.`;
+      case "remove_blank_rows":
+        return `Will remove blank rows from ${target}.`;
+      case "remove_duplicate_rows":
+        return `Will remove duplicate rows from ${target}.`;
+      case "normalize_case":
+        return `Will normalize case in ${target}.`;
+      case "split_column":
+        return `Will split column values in ${target}.`;
+      case "join_columns":
+        return `Will join column values in ${target}.`;
+      case "fill_down":
+        return `Will fill down values in ${target}.`;
+      case "standardize_format":
+        return `Will standardize format in ${target}.`;
+      default:
+        return `Will apply cleanup in ${target}.`;
+    }
+  }
+
+  function getSupportedDateTextPatternSpec(formatPattern) {
+    if (typeof formatPattern !== "string") {
+      return null;
+    }
+
+    const trimmed = formatPattern.trim();
+    const match = trimmed.match(/^[Yy]{4}([\-/.])[Mm]{2}\1[Dd]{2}$/);
+    if (!match) {
+      return null;
+    }
+
+    return {
+      formatType: "date_text",
+      separator: match[1],
+      formatPattern: trimmed
+    };
+  }
+
+  function getSupportedNumberTextPatternSpec(formatPattern) {
+    if (typeof formatPattern !== "string") {
+      return null;
+    }
+
+    const trimmed = formatPattern.trim();
+    const match = trimmed.match(/^(#,##0|0)(?:\.(0+))?$/);
+    if (!match) {
+      return null;
+    }
+
+    return {
+      formatType: "number_text",
+      useGrouping: match[1] === "#,##0",
+      decimals: match[2] ? match[2].length : 0,
+      formatPattern: trimmed
+    };
+  }
+
+  function getSupportedStandardizeFormatSpec(formatType, formatPattern) {
+    if (formatType === "date_text") {
+      return getSupportedDateTextPatternSpec(formatPattern);
+    }
+
+    if (formatType === "number_text") {
+      return getSupportedNumberTextPatternSpec(formatPattern);
+    }
+
+    return null;
+  }
+
+  function getStandardizeFormatSupportError(formatType, formatPattern, hostLabel) {
+    const resolvedHostLabel = hostLabel || "This host";
+
+    if (
+      typeof formatType !== "string" ||
+      !formatType.trim() ||
+      typeof formatPattern !== "string" ||
+      !formatPattern.trim()
+    ) {
+      return `${resolvedHostLabel} requires an exact formatType and formatPattern for standardize_format.`;
+    }
+
+    if (getSupportedStandardizeFormatSpec(formatType, formatPattern)) {
+      return "";
+    }
+
+    if (formatType === "date_text") {
+      return `${resolvedHostLabel} only supports exact year-first date text patterns like YYYY-MM-DD, YYYY/MM/DD, or YYYY.MM.DD.`;
+    }
+
+    if (formatType === "number_text") {
+      return `${resolvedHostLabel} only supports simple fixed-decimal number text patterns like #,##0.00 or 0.00.`;
+    }
+
+    return `${resolvedHostLabel} can't standardize ${formatType} with pattern ${formatPattern} exactly.`;
+  }
+
+  function requiresSecondConditionalComparatorValue(comparator) {
+    return comparator === "between" || comparator === "not_between";
+  }
+
+  function isPreviewDateObject(value) {
+    return Object.prototype.toString.call(value) === "[object Date]" &&
+      typeof value.getTime === "function";
+  }
+
+  function isExactConditionalNumberLiteral(value) {
+    if (typeof value === "number") {
+      return Number.isFinite(value) && !/e/i.test(String(value));
+    }
+
+    return typeof value === "string" &&
+      value === value.trim() &&
+      /^([+-]?)(?:(\d{1,3}(?:,\d{3})+)|(\d+))(?:\.(\d+))?$/.test(value);
+  }
+
+  function isExactConditionalDateLiteral(value) {
+    if (isPreviewDateObject(value)) {
+      return !Number.isNaN(value.getTime()) &&
+        value.getHours() === 0 &&
+        value.getMinutes() === 0 &&
+        value.getSeconds() === 0 &&
+        value.getMilliseconds() === 0;
+    }
+
+    if (typeof value !== "string" || value !== value.trim()) {
+      return false;
+    }
+
+    const match = value.match(/^(\d{4})([-/.])(\d{1,2})\2(\d{1,2})$/);
+    if (!match) {
+      return false;
+    }
+
+    const year = Number(match[1]);
+    const month = Number(match[3]);
+    const day = Number(match[4]);
+    const candidate = new Date(year, month - 1, day);
+    return candidate.getFullYear() === year &&
+      candidate.getMonth() === month - 1 &&
+      candidate.getDate() === day;
+  }
+
+  function getGoogleSheetsConditionalFormatSupportError(preview) {
+    if (
+      preview.managementMode !== "add" &&
+      preview.managementMode !== "replace_all_on_target" &&
+      preview.managementMode !== "clear_on_target"
+    ) {
+      return `This Google Sheets flow can't manage conditional formatting with mode ${preview.managementMode}.`;
+    }
+
+    const unsupportedStyleFields = ["underline", "strikethrough", "numberFormat"].filter((field) =>
+      preview.style && preview.style[field] !== undefined
+    );
+
+    if (unsupportedStyleFields.length > 0) {
+      return `This Google Sheets flow can't set these conditional-format style fields: ${unsupportedStyleFields.join(", ")}.`;
+    }
+
+    if (preview.managementMode === "clear_on_target") {
+      return "";
+    }
+
+    if (
+      (preview.ruleType === "single_color" ||
+        preview.ruleType === "number_compare" ||
+        preview.ruleType === "date_compare") &&
+      typeof preview.comparator !== "string"
+    ) {
+      return `This Google Sheets flow requires a comparator for ${preview.ruleType}.`;
+    }
+
+    if (
+      (preview.ruleType === "single_color" ||
+        preview.ruleType === "number_compare" ||
+        preview.ruleType === "date_compare") &&
+      requiresSecondConditionalComparatorValue(preview.comparator) &&
+      preview.value2 === undefined
+    ) {
+      return `This Google Sheets flow requires value2 for comparator ${preview.comparator}.`;
+    }
+
+    switch (preview.ruleType) {
+      case "single_color": {
+        const supportsNumeric = isExactConditionalNumberLiteral(preview.value) &&
+          (!requiresSecondConditionalComparatorValue(preview.comparator) || isExactConditionalNumberLiteral(preview.value2));
+        const supportsDate = isExactConditionalDateLiteral(preview.value) &&
+          (!requiresSecondConditionalComparatorValue(preview.comparator) || isExactConditionalDateLiteral(preview.value2));
+        const supportsStringEquality =
+          (preview.comparator === "equal_to" || preview.comparator === "not_equal_to") &&
+          typeof preview.value === "string" &&
+          preview.value === preview.value.trim();
+
+        if (supportsNumeric || supportsDate || supportsStringEquality) {
+          return "";
+        }
+
+        return "This Google Sheets flow only supports single_color comparisons against exact numbers, exact year-first dates, or exact string equality.";
+      }
+      case "text_contains":
+        return typeof preview.text === "string" && preview.text.length > 0
+          ? ""
+          : "This Google Sheets flow requires text for ruleType text_contains.";
+      case "number_compare":
+        return isExactConditionalNumberLiteral(preview.value) &&
+            (!requiresSecondConditionalComparatorValue(preview.comparator) || isExactConditionalNumberLiteral(preview.value2))
+          ? ""
+          : "This Google Sheets flow requires exact numeric literals for number_compare.";
+      case "date_compare":
+        return isExactConditionalDateLiteral(preview.value) &&
+            (!requiresSecondConditionalComparatorValue(preview.comparator) || isExactConditionalDateLiteral(preview.value2))
+          ? ""
+          : "This Google Sheets flow requires exact year-first date literals for date_compare.";
+      case "duplicate_values":
+        return "";
+      case "custom_formula":
+        return typeof preview.formula === "string" && preview.formula.trim().length > 0
+          ? ""
+          : "This Google Sheets flow requires a formula for custom_formula.";
+      case "top_n":
+        if (!Number.isInteger(preview.rank) || preview.rank <= 0) {
+          return "This Google Sheets flow requires a positive rank for top_n.";
+        }
+        return preview.direction === "top" || preview.direction === "bottom"
+          ? ""
+          : `This Google Sheets flow requires direction top or bottom for top_n, not ${preview.direction}.`;
+      case "average_compare":
+        return preview.direction === "above" || preview.direction === "below"
+          ? ""
+          : `This Google Sheets flow requires direction above or below for average_compare, not ${preview.direction}.`;
+      case "color_scale":
+        if (!Array.isArray(preview.points) || preview.points.length < 2 || preview.points.length > 3) {
+          return "This Google Sheets flow requires 2 or 3 color scale points.";
+        }
+        if (preview.points.some((point) =>
+          !point ||
+          !["min", "max", "number", "percent", "percentile"].includes(point.type) ||
+          typeof point.color !== "string" ||
+          !/^#[0-9a-f]{6}$/i.test(point.color) ||
+          ((point.type === "number" || point.type === "percent" || point.type === "percentile") &&
+            typeof point.value !== "number")
+        )) {
+          return "This Google Sheets flow requires exact color-scale points with supported types and values.";
+        }
+        return "";
+      default:
+        return `This Google Sheets flow can't apply that conditional formatting rule exactly for ${preview.ruleType}.`;
+    }
+  }
+
+  function getGoogleSheetsPlanSupportError(preview) {
+    if (!preview) {
+      return "";
+    }
+
+    const kind = inferGoogleSheetsPreviewSupportKind(preview);
+
+    if (kind === "pivot_table_plan") {
+      if (typeof preview.targetRange !== "string" || preview.targetRange.trim().length === 0 || preview.targetRange.includes(":")) {
+        return "Choose one destination cell for the pivot table.";
+      }
+
+      if (preview.sort) {
+        const groupedFields = new Set([
+          ...(Array.isArray(preview.rowGroups) ? preview.rowGroups : []),
+          ...(Array.isArray(preview.columnGroups) ? preview.columnGroups : [])
+        ].map((field) => String(field || "").trim()).filter(Boolean));
+        const aggregatedFields = new Set((preview.valueAggregations || [])
+          .map((aggregation) => String(aggregation && aggregation.field || "").trim())
+          .filter(Boolean));
+
+        if (preview.sort.sortOn === "group_field" && !groupedFields.has(String(preview.sort.field || "").trim())) {
+          return "Choose an existing pivot row or column group to sort.";
+        }
+
+        if (preview.sort.sortOn === "aggregated_value") {
+          if (!aggregatedFields.has(String(preview.sort.field || "").trim())) {
+            return "Choose an existing pivot value field to sort by.";
+          }
+
+          if ((preview.rowGroups || []).length > 0 && (preview.columnGroups || []).length > 0) {
+            return "This Google Sheets flow can't sort pivot values when both row and column groups are present yet.";
+          }
+        }
+      }
+
+      if (Array.isArray(preview.valueAggregations) && preview.valueAggregations.some((aggregation) =>
+        !["sum", "count", "average", "min", "max"].includes(aggregation.aggregation)
+      )) {
+        return "This Google Sheets flow only supports pivot values using sum, count, average, min, or max.";
+      }
+
+      return "";
+    }
+
+    if (kind === "chart_plan") {
+      if (!isSupportedGoogleSheetsChartType(preview.chartType)) {
+        return `This Google Sheets flow can't create a ${preview.chartType} chart yet. Try bar, column, line, area, pie, or scatter.`;
+      }
+
+      const targetBounds = parseA1RangeReference(preview.targetRange);
+      if (!targetBounds || targetBounds.startRow !== targetBounds.endRow || targetBounds.startColumn !== targetBounds.endColumn) {
+        return "Google Sheets host requires a single-cell target anchor for charts.";
+      }
+
+      if (typeof preview.categoryField !== "string" || preview.categoryField.trim().length === 0) {
+        return "Choose a category column for the chart first.";
+      }
+
+      if (!Array.isArray(preview.series) || preview.series.length === 0) {
+        return "Choose at least one value series for the chart.";
+      }
+
+      const seenFields = new Set([preview.categoryField.trim()]);
+      for (const series of preview.series) {
+        const field = String(series && series.field || "").trim();
+        if (!field) {
+          return "Each chart series needs a source field.";
+        }
+        if (seenFields.has(field)) {
+          return "Use different fields for the category and each chart series.";
+        }
+        seenFields.add(field);
+      }
+
+      if (preview.legendPosition && !isSupportedGoogleSheetsChartLegendPosition(preview.legendPosition)) {
+        return `This Google Sheets flow can't place the chart legend at ${preview.legendPosition}.`;
+      }
+
+      return "";
+    }
+
+    if (kind === "external_data_plan") {
+      if (!isSingleCellA1Anchor(preview.targetRange)) {
+        return "Google Sheets external data imports require a single destination anchor cell.";
+      }
+
+      if (typeof preview.formula !== "string" || !preview.formula.trim().startsWith("=")) {
+        return "This Google Sheets flow requires an exact formula that starts with =.";
+      }
+
+      if (preview.sourceType === "market_data") {
+        if (preview.provider !== "googlefinance") {
+          return "Google Sheets market data currently requires GOOGLEFINANCE.";
+        }
+        if (!preview.query || typeof preview.query.symbol !== "string" || !preview.query.symbol.trim()) {
+          return "Choose a ticker or market-data symbol first.";
+        }
+        return /GOOGLEFINANCE\s*\(/i.test(preview.formula)
+          ? ""
+          : "Google Sheets market data formulas must use GOOGLEFINANCE(...).";
+      }
+
+      if (preview.sourceType === "web_table_import") {
+        if (typeof preview.sourceUrl !== "string" || !preview.sourceUrl.trim()) {
+          return "Choose a public source URL for the web import first.";
+        }
+
+        if (preview.provider === "importhtml") {
+          if (preview.selectorType !== "table" && preview.selectorType !== "list") {
+            return "IMPORTHTML requires selectorType table or list.";
+          }
+          if (!Number.isInteger(preview.selector) || Number(preview.selector) < 1) {
+            return "IMPORTHTML requires a positive table or list index.";
+          }
+          return /IMPORTHTML\s*\(/i.test(preview.formula)
+            ? ""
+            : "Google Sheets web table imports using IMPORTHTML must contain IMPORTHTML(...).";
+        }
+
+        if (preview.provider === "importxml") {
+          if (preview.selectorType !== "xpath") {
+            return "IMPORTXML requires selectorType xpath.";
+          }
+          if (typeof preview.selector !== "string" || !preview.selector.trim()) {
+            return "IMPORTXML requires an xpath selector.";
+          }
+          return /IMPORTXML\s*\(/i.test(preview.formula)
+            ? ""
+            : "Google Sheets XML imports must contain IMPORTXML(...).";
+        }
+
+        if (preview.provider === "importdata") {
+          if (preview.selectorType !== "direct") {
+            return "IMPORTDATA requires selectorType direct.";
+          }
+          if (preview.selector !== undefined) {
+            return "IMPORTDATA does not use a selector.";
+          }
+          return /IMPORTDATA\s*\(/i.test(preview.formula)
+            ? ""
+            : "Google Sheets direct imports must contain IMPORTDATA(...).";
+        }
+
+        return "This Google Sheets flow can't import that external source exactly.";
+      }
+
+      return "This Google Sheets flow can't import that external source exactly.";
+    }
+
+    if (kind === "range_filter_plan") {
+      if (preview.combiner === "or" && Array.isArray(preview.conditions) && preview.conditions.length > 1) {
+        return "This Google Sheets flow can't combine multiple filter conditions with OR exactly. Split them into separate steps instead.";
+      }
+
+      if (hasRepeatedFilterPreviewColumns(preview.conditions)) {
+        return "This Google Sheets flow can't apply multiple conditions to the same filter column in one exact step.";
+      }
+
+      if (Array.isArray(preview.conditions) && preview.conditions.some((condition) => condition && condition.operator === "topN")) {
+        return "This Google Sheets flow can't apply top-N grid filters exactly yet.";
+      }
+
+      return "";
+    }
+
+    if (kind === "data_validation_plan") {
+      if (preview.ruleType === "list" && preview.allowBlank) {
+        return "This validation would behave differently in Google Sheets. Turn off blank values or choose a different validation setup.";
+      }
+
+      if (
+        preview.ruleType === "checkbox" &&
+        preview.allowBlank &&
+        !(preview.checkedValue !== undefined && preview.uncheckedValue === undefined)
+      ) {
+        return "This checkbox setup would behave differently in Google Sheets when blanks are allowed.";
+      }
+
+      if (
+        preview.ruleType === "checkbox" &&
+        !preview.allowBlank &&
+        preview.checkedValue !== undefined &&
+        preview.uncheckedValue === undefined
+      ) {
+        return "This single-value checkbox setup would behave differently in Google Sheets when blanks are blocked.";
+      }
+    }
+
+    if (kind === "named_range_update" && preview.scope === "sheet") {
+      return "This Google Sheets flow only supports workbook-level named ranges.";
+    }
+
+    if (kind === "conditional_format_plan") {
+      return getGoogleSheetsConditionalFormatSupportError(preview);
+    }
+
+    if (kind === "range_transfer_plan") {
+      if (preview.pasteMode !== "values" &&
+        preview.pasteMode !== "formulas" &&
+        preview.pasteMode !== "formats") {
+        return `This Google Sheets flow only supports transfer modes values, formulas, and formats, not ${preview.pasteMode}.`;
+      }
+
+      if (preview.operation !== "copy") {
+        const sourceBounds = parseA1RangeReference(preview.sourceRange);
+        const targetBounds = deriveTransferTargetPreviewBounds(preview);
+
+        if (
+          preview.sourceSheet === preview.targetSheet &&
+          sourceBounds &&
+          targetBounds &&
+          rangesOverlap(sourceBounds, targetBounds)
+        ) {
+          return `This ${preview.operation} would overlap its source range. Choose a separate destination.`;
+        }
+      }
+    }
+
+    if (kind === "data_cleanup_plan") {
+      switch (preview.operation) {
+        case "trim_whitespace":
+        case "remove_blank_rows":
+        case "remove_duplicate_rows":
+        case "split_column":
+        case "join_columns":
+        case "fill_down":
+          return "";
+        case "normalize_case":
+          if (preview.mode === "upper" || preview.mode === "lower" || preview.mode === "title") {
+            return "";
+          }
+
+          return `This Google Sheets flow only supports normalize_case with upper, lower, or title, not ${preview.mode}.`;
+        case "standardize_format":
+          return getStandardizeFormatSupportError(
+            preview.formatType,
+            preview.formatPattern,
+            "This Google Sheets flow"
+          );
+        default:
+          return `This Google Sheets flow can't apply cleanup operation ${preview.operation} yet.`;
+      }
+    }
+
+    return "";
+  }
+
+  function formatConditionalFormatFields(preview) {
+    const fields = [`management ${preview.managementMode}`];
+
+    if (preview.ruleType) {
+      fields.push(`rule ${preview.ruleType}`);
+    }
+
+    if (preview.comparator) {
+      fields.push(`comparator ${preview.comparator}`);
+    }
+
+    return fields.join(" • ");
+  }
+
+  function formatConditionalFormatDetails(preview) {
+    const details = [];
+
+    if (preview.text) {
+      details.push(`text ${preview.text}`);
+    }
+
+    if (preview.formula) {
+      details.push(`formula ${preview.formula}`);
+    }
+
+    if (preview.value !== undefined) {
+      details.push(`value ${preview.value}`);
+    }
+
+    if (preview.value2 !== undefined) {
+      details.push(`value2 ${preview.value2}`);
+    }
+
+    if (preview.rank !== undefined) {
+      details.push(`rank ${preview.rank}`);
+    }
+
+    if (preview.direction) {
+      details.push(`direction ${preview.direction}`);
+    }
+
+    return details.join(" • ");
+  }
+
+  function formatValidationSource(preview) {
+    if (typeof preview.namedRangeName === "string" && preview.namedRangeName.length > 0) {
+      return `source named range ${preview.namedRangeName}`;
+    }
+
+    if (typeof preview.sourceRange === "string" && preview.sourceRange.length > 0) {
+      return `source range ${preview.sourceRange}`;
+    }
+
+    if (Array.isArray(preview.values) && preview.values.length > 0) {
+      return `values ${preview.values.join(", ")}`;
+    }
+
+    return "";
+  }
+
+  function formatValidationParameters(preview) {
+    const parts = [];
+
+    if (preview.showDropdown === true) {
+      parts.push("dropdown shown");
+    } else if (preview.showDropdown === false) {
+      parts.push("dropdown hidden");
+    }
+
+    if (preview.value !== undefined) {
+      parts.push(`value ${String(preview.value)}`);
+    }
+
+    if (preview.value2 !== undefined) {
+      parts.push(`value2 ${String(preview.value2)}`);
+    }
+
+    return parts.join(" • ");
+  }
+
+  function formatCheckboxValues(preview) {
+    if (preview.ruleType !== "checkbox") {
+      return "";
+    }
+
+    const parts = [];
+
+    if (preview.checkedValue !== undefined) {
+      parts.push(`checked ${String(preview.checkedValue)}`);
+    }
+
+    if (preview.uncheckedValue !== undefined) {
+      parts.push(`unchecked ${String(preview.uncheckedValue)}`);
+    }
+
+    return parts.join(" • ");
+  }
+
+  function getWritebackStatusLine(result) {
+    if (
+      result &&
+      (
+        result.kind === "workbook_structure_update" ||
+        result.kind === "range_format_update" ||
+        result.kind === "sheet_structure_update" ||
+        result.kind === "range_sort" ||
+        result.kind === "range_filter" ||
+        result.kind === "conditional_format_update" ||
+        result.kind === "data_validation_update" ||
+        result.kind === "named_range_update" ||
+        result.kind === "range_transfer_update" ||
+        result.kind === "data_cleanup_update" ||
+        result.kind === "external_data_update" ||
+        result.kind === "composite_update" ||
+        result.kind === "analysis_report_update" ||
+        result.kind === "pivot_table_update" ||
+        result.kind === "chart_update"
+      )
+    ) {
+      return result.summary || "Write applied.";
+    }
+
+    if (result &&
+      result.kind === "range_write" &&
+      typeof result.targetSheet === "string" &&
+      typeof result.targetRange === "string") {
+      return `Write applied to ${result.targetSheet}!${result.targetRange}`;
+    }
+
+    return "Write applied.";
+  }
+
+  function getStructuredPreview(response) {
+    if (!response) {
+      return null;
+    }
+
+    switch (response.type) {
+      case "formula":
+        return {
+          kind: "formula",
+          intent: response.data.intent,
+          formula: response.data.formula,
+          formulaLanguage: response.data.formulaLanguage,
+          targetCell: response.data.targetCell,
+          explanation: response.data.explanation,
+          alternateFormulas: response.data.alternateFormulas || []
+        };
+      case "workbook_structure_update":
+        return {
+          kind: "workbook_structure_update",
+          operation: response.data.operation,
+          sheetName: response.data.sheetName,
+          position: "position" in response.data ? response.data.position : undefined,
+          newSheetName: "newSheetName" in response.data ? response.data.newSheetName : undefined,
+          explanation: response.data.explanation,
+          overwriteRisk: response.data.overwriteRisk
+        };
+      case "sheet_structure_update":
+        return {
+          kind: "sheet_structure_update",
+          targetSheet: response.data.targetSheet,
+          operation: response.data.operation,
+          targetRange: response.data.targetRange,
+          startIndex: response.data.startIndex,
+          count: response.data.count,
+          frozenRows: response.data.frozenRows,
+          frozenColumns: response.data.frozenColumns,
+          color: response.data.color,
+          explanation: response.data.explanation,
+          confirmationLevel: response.data.confirmationLevel
+        };
+      case "range_sort_plan":
+        return {
+          kind: "range_sort_plan",
+          targetSheet: response.data.targetSheet,
+          targetRange: response.data.targetRange,
+          hasHeader: response.data.hasHeader,
+          keys: response.data.keys,
+          explanation: response.data.explanation
+        };
+      case "range_filter_plan":
+        return {
+          kind: "range_filter_plan",
+          targetSheet: response.data.targetSheet,
+          targetRange: response.data.targetRange,
+          hasHeader: response.data.hasHeader,
+          conditions: response.data.conditions,
+          combiner: response.data.combiner,
+          clearExistingFilters: response.data.clearExistingFilters,
+          explanation: response.data.explanation
+        };
+      case "range_format_update":
+        return {
+          kind: "range_format_update",
+          targetSheet: response.data.targetSheet,
+          targetRange: response.data.targetRange,
+          format: response.data.format,
+          explanation: response.data.explanation,
+          overwriteRisk: response.data.overwriteRisk
+        };
+      case "analysis_report_plan": {
+        const resolvedPlan = response.data.outputMode === "materialize_report"
+          ? resolveMaterializedAnalysisReportPlan(response.data)
+          : response.data;
+
+        return {
+          kind: "analysis_report_plan",
+          sourceSheet: resolvedPlan.sourceSheet,
+          sourceRange: resolvedPlan.sourceRange,
+          outputMode: resolvedPlan.outputMode,
+          targetSheet: resolvedPlan.targetSheet,
+          targetRange: resolvedPlan.targetRange,
+          sections: resolvedPlan.sections,
+          explanation: resolvedPlan.explanation,
+          confidence: resolvedPlan.confidence,
+          requiresConfirmation: resolvedPlan.outputMode === "materialize_report",
+          affectedRanges: resolvedPlan.affectedRanges,
+          overwriteRisk: resolvedPlan.overwriteRisk,
+          confirmationLevel: resolvedPlan.confirmationLevel,
+          summary: getAnalysisReportPreviewSummary(resolvedPlan),
+          rows: buildAnalysisReportMatrix(resolvedPlan)
+        };
+      }
+      case "pivot_table_plan":
+        return {
+          kind: "pivot_table_plan",
+          sourceSheet: response.data.sourceSheet,
+          sourceRange: response.data.sourceRange,
+          targetSheet: response.data.targetSheet,
+          targetRange: response.data.targetRange,
+          rowGroups: response.data.rowGroups,
+          columnGroups: response.data.columnGroups || [],
+          valueAggregations: response.data.valueAggregations,
+          filters: response.data.filters || [],
+          sort: response.data.sort,
+          explanation: response.data.explanation,
+          confidence: response.data.confidence,
+          requiresConfirmation: response.data.requiresConfirmation,
+          affectedRanges: response.data.affectedRanges,
+          overwriteRisk: response.data.overwriteRisk,
+          confirmationLevel: response.data.confirmationLevel,
+          summary: getPivotTablePreviewSummary(response.data)
+        };
+      case "chart_plan":
+        return {
+          kind: "chart_plan",
+          sourceSheet: response.data.sourceSheet,
+          sourceRange: response.data.sourceRange,
+          targetSheet: response.data.targetSheet,
+          targetRange: response.data.targetRange,
+          chartType: response.data.chartType,
+          categoryField: response.data.categoryField,
+          series: response.data.series,
+          title: response.data.title,
+          legendPosition: response.data.legendPosition,
+          explanation: response.data.explanation,
+          confidence: response.data.confidence,
+          requiresConfirmation: response.data.requiresConfirmation,
+          affectedRanges: response.data.affectedRanges,
+          overwriteRisk: response.data.overwriteRisk,
+          confirmationLevel: response.data.confirmationLevel,
+          summary: getChartPreviewSummary(response.data)
+        };
+      case "external_data_plan":
+        return {
+          kind: "external_data_plan",
+          sourceType: response.data.sourceType,
+          provider: response.data.provider,
+          query: response.data.query,
+          sourceUrl: response.data.sourceUrl,
+          selectorType: response.data.selectorType,
+          selector: response.data.selector,
+          targetSheet: response.data.targetSheet,
+          targetRange: response.data.targetRange,
+          formula: response.data.formula,
+          explanation: response.data.explanation,
+          confidence: response.data.confidence,
+          requiresConfirmation: response.data.requiresConfirmation,
+          affectedRanges: response.data.affectedRanges,
+          overwriteRisk: response.data.overwriteRisk,
+          confirmationLevel: response.data.confirmationLevel,
+          summary: response.data.sourceType === "market_data"
+            ? `Will anchor market data for ${response.data.query.symbol} at ${response.data.targetSheet}!${response.data.targetRange}.`
+            : `Will anchor a ${String(response.data.provider).toUpperCase()} import at ${response.data.targetSheet}!${response.data.targetRange}.`
+        };
+      case "conditional_format_plan":
+        return {
+          kind: "conditional_format_plan",
+          targetSheet: response.data.targetSheet,
+          targetRange: response.data.targetRange,
+          managementMode: response.data.managementMode,
+          ruleType: response.data.ruleType,
+          comparator: response.data.comparator,
+          text: response.data.text,
+          formula: response.data.formula,
+          value: response.data.value,
+          value2: response.data.value2,
+          rank: response.data.rank,
+          direction: response.data.direction,
+          points: response.data.points,
+          style: response.data.style,
+          affectedRanges: response.data.affectedRanges,
+          replacesExistingRules: response.data.replacesExistingRules,
+          explanation: response.data.explanation,
+          confidence: response.data.confidence,
+          requiresConfirmation: response.data.requiresConfirmation,
+          summary: getConditionalFormatPreviewSummary(response.data)
+        };
+      case "data_validation_plan":
+        return {
+          kind: "data_validation_plan",
+          targetSheet: response.data.targetSheet,
+          targetRange: response.data.targetRange,
+          ruleType: response.data.ruleType,
+          comparator: response.data.comparator,
+          value: response.data.value,
+          value2: response.data.value2,
+          showDropdown: response.data.showDropdown,
+          formula: response.data.formula,
+          checkedValue: response.data.checkedValue,
+          uncheckedValue: response.data.uncheckedValue,
+          values: response.data.values,
+          sourceRange: response.data.sourceRange,
+          namedRangeName: response.data.namedRangeName,
+          allowBlank: response.data.allowBlank,
+          invalidDataBehavior: response.data.invalidDataBehavior,
+          helpText: response.data.helpText,
+          replacesExistingValidation: response.data.replacesExistingValidation,
+          explanation: response.data.explanation,
+          confidence: response.data.confidence,
+          requiresConfirmation: response.data.requiresConfirmation,
+          summary: getDataValidationPreviewSummary(response.data)
+        };
+      case "named_range_update":
+        return {
+          kind: "named_range_update",
+          operation: response.data.operation,
+          scope: response.data.scope,
+          name: response.data.name,
+          sheetName: response.data.sheetName,
+          targetSheet: response.data.targetSheet,
+          targetRange: response.data.targetRange,
+          newName: response.data.newName,
+          explanation: response.data.explanation,
+          confidence: response.data.confidence,
+          requiresConfirmation: response.data.requiresConfirmation,
+          summary: getNamedRangePreviewSummary(response.data)
+        };
+      case "composite_plan":
+        return {
+          kind: "composite_plan",
+          stepCount: response.data.steps.length,
+          steps: response.data.steps.map((step) =>
+            Object.assign({}, buildCompositeStepPreview(step), {
+              plan: step.plan,
+              supportError: getGoogleSheetsPlanSupportError(step.plan)
+            })
+          ),
+          explanation: response.data.explanation,
+          confidence: response.data.confidence,
+          reversible: response.data.reversible,
+          dryRunRecommended: response.data.dryRunRecommended,
+          dryRunRequired: response.data.dryRunRequired,
+          affectedRanges: response.data.affectedRanges,
+          overwriteRisk: response.data.overwriteRisk,
+          confirmationLevel: response.data.confirmationLevel,
+          summary: getCompositePreviewSummary(response.data)
+        };
+      case "range_transfer_plan":
+        return {
+          kind: "range_transfer_plan",
+          sourceSheet: response.data.sourceSheet,
+          sourceRange: response.data.sourceRange,
+          targetSheet: response.data.targetSheet,
+          targetRange: response.data.targetRange,
+          operation: response.data.operation,
+          pasteMode: response.data.pasteMode,
+          transpose: response.data.transpose,
+          explanation: response.data.explanation,
+          confidence: response.data.confidence,
+          requiresConfirmation: response.data.requiresConfirmation,
+          affectedRanges: response.data.affectedRanges,
+          overwriteRisk: response.data.overwriteRisk,
+          confirmationLevel: response.data.confirmationLevel,
+          summary: getRangeTransferPreviewSummary(response.data)
+        };
+      case "data_cleanup_plan":
+        return {
+          kind: "data_cleanup_plan",
+          targetSheet: response.data.targetSheet,
+          targetRange: response.data.targetRange,
+          operation: response.data.operation,
+          explanation: response.data.explanation,
+          confidence: response.data.confidence,
+          requiresConfirmation: response.data.requiresConfirmation,
+          affectedRanges: response.data.affectedRanges,
+          overwriteRisk: response.data.overwriteRisk,
+          confirmationLevel: response.data.confirmationLevel,
+          keyColumns: response.data.keyColumns,
+          mode: response.data.mode,
+          sourceColumn: response.data.sourceColumn,
+          delimiter: response.data.delimiter,
+          targetStartColumn: response.data.targetStartColumn,
+          sourceColumns: response.data.sourceColumns,
+          targetColumn: response.data.targetColumn,
+          columns: response.data.columns,
+          formatType: response.data.formatType,
+          formatPattern: response.data.formatPattern,
+          summary: getDataCleanupPreviewSummary(response.data)
+        };
+      case "sheet_update": {
+        const matrices = [
+          response.data.values ? "values" : null,
+          response.data.formulas ? "formulas" : null,
+          response.data.notes ? "notes" : null
+        ].filter(Boolean);
+
+        return {
+          kind: "sheet_update",
+          targetSheet: response.data.targetSheet,
+          targetRange: response.data.targetRange,
+          shape: response.data.shape,
+          operation: response.data.operation,
+          overwriteRisk: response.data.overwriteRisk,
+          matrixKind: matrices.length > 1 ? "mixed_update" : (matrices[0] || "values"),
+          headers: [],
+          rows: buildWriteMatrix(response.data)
+        };
+      }
+      case "sheet_import_plan":
+        return {
+          kind: "sheet_import_plan",
+          targetSheet: response.data.targetSheet,
+          targetRange: response.data.targetRange,
+          shape: response.data.shape,
+          extractionMode: response.data.extractionMode,
+          headers: response.data.headers,
+          rows: response.data.values
+        };
+      case "attachment_analysis":
+        return {
+          kind: "attachment_analysis",
+          sourceAttachmentId: response.data.sourceAttachmentId,
+          contentKind: response.data.contentKind,
+          extractionMode: response.data.extractionMode,
+          summary: response.data.summary
+        };
+      case "extracted_table":
+        return {
+          kind: "extracted_table",
+          sourceAttachmentId: response.data.sourceAttachmentId,
+          extractionMode: response.data.extractionMode,
+          headers: response.data.headers,
+          rows: response.data.rows,
+          shape: response.data.shape || {
+            rows: response.data.rows.length,
+            columns: response.data.headers.length > 0
+              ? response.data.headers.length
+              : Math.max(...response.data.rows.map((row) => row.length), 0)
+          }
+        };
+      case "document_summary":
+        return {
+          kind: "document_summary",
+          sourceAttachmentId: response.data.sourceAttachmentId,
+          contentKind: response.data.contentKind,
+          extractionMode: response.data.extractionMode,
+          keyPoints: response.data.keyPoints || []
+        };
+      default:
+        return null;
+    }
+  }
+
+  function renderAttachmentStrip() {
+    elements.attachmentStrip.innerHTML = state.pendingAttachments.map((attachment, index) => `
+      <div class="chip">
+        <img src="${attachment.previewUrl}" alt="" />
+        <span>${escapeHtml(attachment.fileName)}</span>
+        <span class="chip-status">${escapeHtml(attachment.status)}</span>
+        <button type="button" data-remove="${index}">x</button>
+      </div>
+    `).join("");
+
+    elements.attachmentStrip.querySelectorAll("[data-remove]").forEach((button) => {
+      button.addEventListener("click", () => {
+        const index = Number(button.getAttribute("data-remove"));
+        const removed = state.pendingAttachments.splice(index, 1)[0];
+        if (removed && removed.previewUrl) {
+          URL.revokeObjectURL(removed.previewUrl);
+        }
+        renderAttachmentStrip();
+      });
+    });
+  }
+
+  function renderWarnings(warnings) {
+    return warnings.map((warning) => `
+      <div class="warning-line">${escapeHtml(warning.message)}</div>
+    `).join("");
+  }
+
+  function renderSuggestions(suggestions) {
+    if (suggestions.length === 0) {
+      return "";
+    }
+
+    return `
+      <div class="suggestions">
+        ${suggestions.map((suggestion, index) => `
+          <button type="button" class="suggestion" data-suggestion-index="${index}">
+            ${escapeHtml(suggestion)}
+          </button>
+        `).join("")}
+      </div>
+    `;
+  }
+
+  function renderTable(headers, rows) {
+    const headMarkup = headers.length > 0 ? `
+      <thead>
+        <tr>${headers.map((cell) => `<th>${escapeHtml(cell)}</th>`).join("")}</tr>
+      </thead>
+    ` : "";
+
+    return `
+      <table>
+        ${headMarkup}
+        <tbody>
+          ${rows.map((row) => `
+            <tr>${row.map((cell) => `<td>${escapeHtml(cell == null ? "" : cell)}</td>`).join("")}</tr>
+          `).join("")}
+        </tbody>
+      </table>
+    `;
+  }
+
+  function renderStructuredPreview(response, message) {
+    const preview = getStructuredPreview(response);
+    if (!preview) {
+      return "";
+    }
+
+    if (preview.kind === "formula") {
+      return `
+        <div class="preview">
+          <div class="preview-meta">
+            Formula${preview.intent ? ` • ${escapeHtml(preview.intent)}` : ""} • ${escapeHtml(preview.formulaLanguage)}
+            ${preview.targetCell ? ` • ${escapeHtml(preview.targetCell)}` : ""}
+          </div>
+          <pre class="formula-block">${escapeHtml(preview.formula)}</pre>
+        </div>
+      `;
+    }
+
+    if (preview.kind === "workbook_structure_update") {
+      return `
+        <div class="preview">
+          <div class="preview-meta">
+            ${escapeHtml(preview.operation)}
+            • ${escapeHtml(preview.sheetName)}
+            ${preview.newSheetName ? ` • ${escapeHtml(preview.newSheetName)}` : ""}
+            ${formatWorkbookPositionLabel(preview.position)}
+            ${preview.overwriteRisk ? ` • overwrite ${escapeHtml(preview.overwriteRisk)}` : ""}
+          </div>
+          <div>${escapeHtml(preview.explanation)}</div>
+          ${getRequiresConfirmation(response) ? `
+            <div class="preview-actions">
+              <button type="button" data-confirm-run="${escapeHtml(message.runId || "")}" data-request="${escapeHtml(message.requestId || "")}">
+                Confirm Workbook Update
+              </button>
+            </div>
+          ` : ""}
+        </div>
+      `;
+    }
+
+    if (preview.kind === "sheet_structure_update") {
+      const structureDetail = formatSheetStructureDetail(preview);
+
+      return `
+        <div class="preview">
+          <div class="preview-meta">
+            ${escapeHtml(preview.operation)}
+            • ${escapeHtml(preview.targetSheet)}
+            ${preview.targetRange ? ` • ${escapeHtml(preview.targetRange)}` : ""}
+            ${preview.confirmationLevel ? ` • ${escapeHtml(preview.confirmationLevel)}` : ""}
+          </div>
+          ${structureDetail ? `<div>${escapeHtml(structureDetail)}</div>` : ""}
+          <div>${escapeHtml(preview.explanation)}</div>
+          ${getRequiresConfirmation(response) ? `
+            <div class="preview-actions">
+              <button type="button" data-confirm-run="${escapeHtml(message.runId || "")}" data-request="${escapeHtml(message.requestId || "")}">
+                Confirm Sheet Update
+              </button>
+            </div>
+          ` : ""}
+        </div>
+      `;
+    }
+
+    if (preview.kind === "range_sort_plan") {
+      const keysSummary = formatSortKeys(preview.keys);
+
+      return `
+        <div class="preview">
+          <div class="preview-meta">
+            ${escapeHtml(preview.targetSheet)}!${escapeHtml(preview.targetRange)}
+            • ${preview.hasHeader ? "header" : "no header"}
+          </div>
+          <div>${escapeHtml(keysSummary)}</div>
+          <div>${escapeHtml(preview.explanation)}</div>
+          ${getRequiresConfirmation(response) ? `
+            <div class="preview-actions">
+              <button type="button" data-confirm-run="${escapeHtml(message.runId || "")}" data-request="${escapeHtml(message.requestId || "")}">
+                Confirm Sort
+              </button>
+            </div>
+          ` : ""}
+        </div>
+      `;
+    }
+
+    if (preview.kind === "range_filter_plan") {
+      const conditionsSummary = formatFilterConditions(preview.conditions);
+      const supportError = getGoogleSheetsPlanSupportError(preview);
+
+      return `
+        <div class="preview">
+          <div class="preview-meta">
+            ${escapeHtml(preview.targetSheet)}!${escapeHtml(preview.targetRange)}
+            • ${preview.hasHeader ? "header" : "no header"}
+            • ${escapeHtml(preview.combiner)}
+          </div>
+          <div>${escapeHtml(conditionsSummary)}</div>
+          <div class="preview-meta">${escapeHtml(formatClearExistingFiltersState(preview.clearExistingFilters))}</div>
+          <div>${escapeHtml(preview.explanation)}</div>
+          ${supportError ? `<div class="warning-line">${escapeHtml(supportError)}</div>` : ""}
+          ${getRequiresConfirmation(response) && !supportError ? `
+            <div class="preview-actions">
+              <button type="button" data-confirm-run="${escapeHtml(message.runId || "")}" data-request="${escapeHtml(message.requestId || "")}">
+                Confirm Filter
+              </button>
+            </div>
+          ` : ""}
+        </div>
+      `;
+    }
+
+    if (preview.kind === "range_format_update") {
+      const formatFields = formatRangeFormatFields(preview.format);
+
+      return `
+        <div class="preview">
+          <div class="preview-meta">
+            ${escapeHtml(preview.targetSheet)}!${escapeHtml(preview.targetRange)}
+            ${formatFields ? ` • ${escapeHtml(formatFields)}` : ""}
+            ${preview.overwriteRisk ? ` • overwrite ${escapeHtml(preview.overwriteRisk)}` : ""}
+          </div>
+          <div>${escapeHtml(preview.explanation)}</div>
+          ${getRequiresConfirmation(response) ? `
+            <div class="preview-actions">
+              <button type="button" data-confirm-run="${escapeHtml(message.runId || "")}" data-request="${escapeHtml(message.requestId || "")}">
+                Confirm Format Update
+              </button>
+            </div>
+          ` : ""}
+        </div>
+      `;
+    }
+
+    if (preview.kind === "composite_plan") {
+      const workflowFlags = [
+        preview.reversible ? "reversible" : "non-reversible",
+        preview.dryRunRequired ? "dry run required" : "",
+        preview.dryRunRecommended ? "dry run recommended" : "",
+        preview.confirmationLevel ? preview.confirmationLevel : ""
+      ].filter(Boolean).join(" • ");
+      const unsupportedSteps = getCompositePreviewSupportErrors(preview.steps);
+      const compositeSupportError = unsupportedSteps.length > 0
+        ? "Some workflow steps can't run in this Google Sheets runtime yet. Review the flagged steps and simplify the workflow before confirming."
+        : "";
+
+      return `
+        <div class="preview">
+          <div class="preview-meta">
+            ${preview.stepCount} step(s)
+            ${workflowFlags ? ` • ${escapeHtml(workflowFlags)}` : ""}
+          </div>
+          <div>${escapeHtml(preview.explanation)}</div>
+          <div class="preview-meta">${escapeHtml(preview.summary)}</div>
+          <ul class="key-points">
+            ${preview.steps.map((step) => {
+              const stepFlags = [
+                step.dependsOn.length > 0 ? `depends on ${step.dependsOn.join(", ")}` : "no dependencies",
+                step.continueOnError ? "continue on error" : "stop on error",
+                step.destructive ? "destructive" : "",
+                step.reversible ? "reversible" : "non-reversible"
+              ].filter(Boolean).join(" • ");
+              return `<li><strong>${escapeHtml(step.stepId)}</strong> — ${escapeHtml(step.summary)}${stepFlags ? ` <span class="preview-meta">${escapeHtml(stepFlags)}</span>` : ""}${step.supportError ? ` <div class="warning-line">${escapeHtml(step.supportError)}</div>` : ""}</li>`;
+            }).join("")}
+          </ul>
+          ${Array.isArray(preview.affectedRanges) && preview.affectedRanges.length > 0
+            ? `<div class="preview-meta">${escapeHtml(preview.affectedRanges.join(", "))}</div>`
+            : ""}
+          ${compositeSupportError ? `<div class="warning-line">${escapeHtml(compositeSupportError)}</div>` : ""}
+          ${getRequiresConfirmation(response) && !compositeSupportError ? `
+            <div class="preview-actions">
+              <button type="button" data-confirm-run="${escapeHtml(message.runId || "")}" data-request="${escapeHtml(message.requestId || "")}">
+                Confirm Workflow
+              </button>
+            </div>
+          ` : ""}
+        </div>
+      `;
+    }
+
+    if (preview.kind === "analysis_report_plan") {
+      return `
+        <div class="preview">
+          <div class="preview-meta">
+            ${escapeHtml(preview.sourceSheet)}!${escapeHtml(preview.sourceRange)}
+            ${preview.targetSheet && preview.targetRange
+              ? ` → ${escapeHtml(preview.targetSheet)}!${escapeHtml(preview.targetRange)}`
+              : ""}
+            • ${escapeHtml(preview.outputMode)}
+            ${preview.overwriteRisk ? ` • overwrite ${escapeHtml(preview.overwriteRisk)}` : ""}
+            ${preview.confirmationLevel ? ` • ${escapeHtml(preview.confirmationLevel)}` : ""}
+          </div>
+          <div>${escapeHtml(preview.explanation)}</div>
+          <div class="preview-meta">${escapeHtml(preview.summary)}</div>
+          ${Array.isArray(preview.affectedRanges) && preview.affectedRanges.length > 0
+            ? `<div class="preview-meta">${escapeHtml(preview.affectedRanges.join(", "))}</div>`
+            : ""}
+          ${renderTable([], preview.rows)}
+          ${getRequiresConfirmation(response) ? `
+            <div class="preview-actions">
+              <button type="button" data-confirm-run="${escapeHtml(message.runId || "")}" data-request="${escapeHtml(message.requestId || "")}">
+                Confirm Analysis Report
+              </button>
+            </div>
+          ` : ""}
+        </div>
+      `;
+    }
+
+    if (preview.kind === "pivot_table_plan") {
+      const supportError = getGoogleSheetsPlanSupportError(preview);
+      const pivotDetails = [
+        `rows ${preview.rowGroups.join(", ")}`,
+        preview.columnGroups.length > 0 ? `columns ${preview.columnGroups.join(", ")}` : "",
+        `values ${preview.valueAggregations.map((aggregation) => `${aggregation.field} ${aggregation.aggregation}`).join(", ")}`,
+        preview.sort ? `sort ${preview.sort.field} ${preview.sort.direction} on ${preview.sort.sortOn}` : ""
+      ].filter(Boolean).join(" • ");
+
+      return `
+        <div class="preview">
+          <div class="preview-meta">
+            ${escapeHtml(preview.sourceSheet)}!${escapeHtml(preview.sourceRange)}
+            → ${escapeHtml(preview.targetSheet)}!${escapeHtml(preview.targetRange)}
+            ${preview.overwriteRisk ? ` • overwrite ${escapeHtml(preview.overwriteRisk)}` : ""}
+            ${preview.confirmationLevel ? ` • ${escapeHtml(preview.confirmationLevel)}` : ""}
+          </div>
+          <div>${escapeHtml(preview.explanation)}</div>
+          <div class="preview-meta">${escapeHtml(preview.summary)}</div>
+          ${pivotDetails ? `<div class="preview-meta">${escapeHtml(pivotDetails)}</div>` : ""}
+          ${Array.isArray(preview.affectedRanges) && preview.affectedRanges.length > 0
+            ? `<div class="preview-meta">${escapeHtml(preview.affectedRanges.join(", "))}</div>`
+            : ""}
+          ${supportError ? `<div class="warning-line">${escapeHtml(supportError)}</div>` : ""}
+          ${getRequiresConfirmation(response) && !supportError ? `
+            <div class="preview-actions">
+              <button type="button" data-confirm-run="${escapeHtml(message.runId || "")}" data-request="${escapeHtml(message.requestId || "")}">
+                Confirm Pivot Table
+              </button>
+            </div>
+          ` : ""}
+        </div>
+      `;
+    }
+
+    if (preview.kind === "chart_plan") {
+      const supportError = getGoogleSheetsPlanSupportError(preview);
+      const chartDetails = [
+        preview.categoryField ? `category ${preview.categoryField}` : "",
+        `series ${preview.series.map((series) => series.label ? `${series.field} as ${series.label}` : series.field).join(", ")}`,
+        preview.title ? `title ${preview.title}` : "",
+        preview.legendPosition ? `legend ${preview.legendPosition}` : ""
+      ].filter(Boolean).join(" • ");
+
+      return `
+        <div class="preview">
+          <div class="preview-meta">
+            ${escapeHtml(preview.sourceSheet)}!${escapeHtml(preview.sourceRange)}
+            → ${escapeHtml(preview.targetSheet)}!${escapeHtml(preview.targetRange)}
+            • ${escapeHtml(preview.chartType)}
+            ${preview.overwriteRisk ? ` • overwrite ${escapeHtml(preview.overwriteRisk)}` : ""}
+            ${preview.confirmationLevel ? ` • ${escapeHtml(preview.confirmationLevel)}` : ""}
+          </div>
+          <div>${escapeHtml(preview.explanation)}</div>
+          <div class="preview-meta">${escapeHtml(preview.summary)}</div>
+          ${chartDetails ? `<div class="preview-meta">${escapeHtml(chartDetails)}</div>` : ""}
+          ${Array.isArray(preview.affectedRanges) && preview.affectedRanges.length > 0
+            ? `<div class="preview-meta">${escapeHtml(preview.affectedRanges.join(", "))}</div>`
+            : ""}
+          ${supportError ? `<div class="warning-line">${escapeHtml(supportError)}</div>` : ""}
+          ${getRequiresConfirmation(response) && !supportError ? `
+            <div class="preview-actions">
+              <button type="button" data-confirm-run="${escapeHtml(message.runId || "")}" data-request="${escapeHtml(message.requestId || "")}">
+                Confirm Chart
+              </button>
+            </div>
+          ` : ""}
+        </div>
+      `;
+    }
+
+    if (preview.kind === "conditional_format_plan") {
+      const conditionalFields = formatConditionalFormatFields(preview);
+      const conditionalDetails = formatConditionalFormatDetails(preview);
+      const supportError = getGoogleSheetsPlanSupportError(preview);
+
+      return `
+        <div class="preview">
+          <div class="preview-meta">
+            ${escapeHtml(preview.targetSheet)}!${escapeHtml(preview.targetRange)}
+            ${conditionalFields ? ` • ${escapeHtml(conditionalFields)}` : ""}
+            ${preview.replacesExistingRules ? " • replaces existing rules" : ""}
+          </div>
+          <div>${escapeHtml(preview.explanation)}</div>
+          <div class="preview-meta">${escapeHtml(preview.summary)}</div>
+          ${conditionalDetails ? `<div class="preview-meta">${escapeHtml(conditionalDetails)}</div>` : ""}
+          ${Array.isArray(preview.affectedRanges) && preview.affectedRanges.length > 0
+            ? `<div class="preview-meta">${escapeHtml(preview.affectedRanges.join(", "))}</div>`
+            : ""}
+          ${supportError ? `<div class="warning-line">${escapeHtml(supportError)}</div>` : ""}
+          ${getRequiresConfirmation(response) && !supportError ? `
+            <div class="preview-actions">
+              <button type="button" data-confirm-run="${escapeHtml(message.runId || "")}" data-request="${escapeHtml(message.requestId || "")}">
+                Confirm Conditional Formatting
+              </button>
+            </div>
+          ` : ""}
+        </div>
+      `;
+    }
+
+    if (preview.kind === "data_validation_plan") {
+      const validationSource = formatValidationSource(preview);
+      const validationParameters = formatValidationParameters(preview);
+      const checkboxValues = formatCheckboxValues(preview);
+      const supportError = getGoogleSheetsPlanSupportError(preview);
+
+      return `
+        <div class="preview">
+          <div class="preview-meta">
+            ${escapeHtml(preview.targetSheet)}!${escapeHtml(preview.targetRange)}
+            • ${escapeHtml(preview.ruleType)}
+            ${preview.comparator ? ` • ${escapeHtml(preview.comparator)}` : ""}
+            ${preview.allowBlank ? " • allow blank" : " • no blank"}
+            • ${escapeHtml(preview.invalidDataBehavior)}
+            ${preview.replacesExistingValidation ? " • replaces existing validation" : ""}
+          </div>
+          <div>${escapeHtml(preview.explanation)}</div>
+          ${preview.formula ? `<div class="preview-meta">${escapeHtml(preview.formula)}</div>` : ""}
+          ${validationParameters ? `<div class="preview-meta">${escapeHtml(validationParameters)}</div>` : ""}
+          ${checkboxValues ? `<div class="preview-meta">${escapeHtml(checkboxValues)}</div>` : ""}
+          ${preview.helpText ? `<div class="preview-meta">${escapeHtml(preview.helpText)}</div>` : ""}
+          ${validationSource ? `<div class="preview-meta">${escapeHtml(validationSource)}</div>` : ""}
+          ${supportError ? `<div class="warning-line">${escapeHtml(supportError)}</div>` : ""}
+          <div class="preview-meta">${escapeHtml(preview.summary)}</div>
+          ${getRequiresConfirmation(response) && !supportError ? `
+            <div class="preview-actions">
+              <button type="button" data-confirm-run="${escapeHtml(message.runId || "")}" data-request="${escapeHtml(message.requestId || "")}">
+                Confirm Validation
+              </button>
+            </div>
+          ` : ""}
+        </div>
+      `;
+    }
+
+    if (preview.kind === "named_range_update") {
+      const supportError = getGoogleSheetsPlanSupportError(preview);
+      return `
+        <div class="preview">
+          <div class="preview-meta">
+            ${escapeHtml(preview.operation)}
+            • ${escapeHtml(preview.name)}
+            ${preview.scope ? ` • ${escapeHtml(preview.scope)}` : ""}
+            ${preview.targetSheet && preview.targetRange ? ` • ${escapeHtml(preview.targetSheet)}!${escapeHtml(preview.targetRange)}` : ""}
+            ${preview.newName ? ` • ${escapeHtml(preview.newName)}` : ""}
+          </div>
+          <div>${escapeHtml(preview.explanation)}</div>
+          ${supportError ? `<div class="warning-line">${escapeHtml(supportError)}</div>` : ""}
+          <div class="preview-meta">${escapeHtml(preview.summary)}</div>
+          ${getRequiresConfirmation(response) && !supportError ? `
+            <div class="preview-actions">
+              <button type="button" data-confirm-run="${escapeHtml(message.runId || "")}" data-request="${escapeHtml(message.requestId || "")}">
+                Confirm Named Range Update
+              </button>
+            </div>
+          ` : ""}
+        </div>
+      `;
+    }
+
+    if (preview.kind === "range_transfer_plan") {
+      const supportError = getGoogleSheetsPlanSupportError(preview);
+      return `
+        <div class="preview">
+          <div class="preview-meta">
+            ${escapeHtml(preview.sourceSheet)}!${escapeHtml(preview.sourceRange)}
+            → ${escapeHtml(preview.targetSheet)}!${escapeHtml(preview.targetRange)}
+            • ${escapeHtml(preview.operation)}
+            • ${escapeHtml(preview.pasteMode)}
+            • transpose ${preview.transpose ? "on" : "off"}
+            ${preview.overwriteRisk ? ` • overwrite ${escapeHtml(preview.overwriteRisk)}` : ""}
+            ${preview.confirmationLevel ? ` • ${escapeHtml(preview.confirmationLevel)}` : ""}
+          </div>
+          <div>${escapeHtml(preview.explanation)}</div>
+          <div class="preview-meta">${escapeHtml(preview.summary)}</div>
+          ${Array.isArray(preview.affectedRanges) && preview.affectedRanges.length > 0
+            ? `<div class="preview-meta">${escapeHtml(preview.affectedRanges.join(", "))}</div>`
+            : ""}
+          ${supportError ? `<div class="warning-line">${escapeHtml(supportError)}</div>` : ""}
+          ${getRequiresConfirmation(response) && !supportError ? `
+            <div class="preview-actions">
+              <button type="button" data-confirm-run="${escapeHtml(message.runId || "")}" data-request="${escapeHtml(message.requestId || "")}">
+                Confirm Transfer
+              </button>
+            </div>
+          ` : ""}
+        </div>
+      `;
+    }
+
+    if (preview.kind === "data_cleanup_plan") {
+      const supportError = getGoogleSheetsPlanSupportError(preview);
+      const cleanupDetails = [
+        Array.isArray(preview.keyColumns) && preview.keyColumns.length > 0
+          ? `keys ${preview.keyColumns.join(", ")}`
+          : "",
+        preview.mode ? `mode ${preview.mode}` : "",
+        preview.sourceColumn ? `source ${preview.sourceColumn}` : "",
+        Array.isArray(preview.sourceColumns) && preview.sourceColumns.length > 0
+          ? `sources ${preview.sourceColumns.join(", ")}`
+          : "",
+        preview.targetStartColumn ? `target start ${preview.targetStartColumn}` : "",
+        preview.targetColumn ? `target ${preview.targetColumn}` : "",
+        Array.isArray(preview.columns) && preview.columns.length > 0
+          ? `columns ${preview.columns.join(", ")}`
+          : "",
+        preview.delimiter ? `delimiter ${preview.delimiter}` : "",
+        preview.formatType ? `format ${preview.formatType}` : "",
+        preview.formatPattern ? `pattern ${preview.formatPattern}` : ""
+      ].filter(Boolean).join(" • ");
+
+      return `
+        <div class="preview">
+          <div class="preview-meta">
+            ${escapeHtml(preview.targetSheet)}!${escapeHtml(preview.targetRange)}
+            • ${escapeHtml(preview.operation)}
+            ${preview.overwriteRisk ? ` • overwrite ${escapeHtml(preview.overwriteRisk)}` : ""}
+            ${preview.confirmationLevel ? ` • ${escapeHtml(preview.confirmationLevel)}` : ""}
+          </div>
+          <div>${escapeHtml(preview.explanation)}</div>
+          <div class="preview-meta">${escapeHtml(preview.summary)}</div>
+          ${cleanupDetails ? `<div class="preview-meta">${escapeHtml(cleanupDetails)}</div>` : ""}
+          ${Array.isArray(preview.affectedRanges) && preview.affectedRanges.length > 0
+            ? `<div class="preview-meta">${escapeHtml(preview.affectedRanges.join(", "))}</div>`
+            : ""}
+          ${supportError ? `<div class="warning-line">${escapeHtml(supportError)}</div>` : ""}
+          ${getRequiresConfirmation(response) && !supportError ? `
+            <div class="preview-actions">
+              <button type="button" data-confirm-run="${escapeHtml(message.runId || "")}" data-request="${escapeHtml(message.requestId || "")}">
+                Confirm Cleanup
+              </button>
+            </div>
+          ` : ""}
+        </div>
+      `;
+    }
+
+    if (preview.kind === "external_data_plan") {
+      const supportError = getGoogleSheetsPlanSupportError(preview);
+      const sourceDetails = preview.sourceType === "market_data"
+        ? [
+            preview.query?.symbol ? `symbol ${preview.query.symbol}` : "",
+            preview.query?.attribute ? `attribute ${preview.query.attribute}` : "",
+            preview.query?.interval ? `interval ${preview.query.interval}` : ""
+          ].filter(Boolean).join(" • ")
+        : [
+            preview.sourceUrl ? `url ${preview.sourceUrl}` : "",
+            preview.selectorType ? `selector ${preview.selectorType}` : "",
+            preview.selector !== undefined ? `${preview.selector}` : ""
+          ].filter(Boolean).join(" • ");
+
+      return `
+        <div class="preview">
+          <div class="preview-meta">
+            ${escapeHtml(preview.targetSheet)}!${escapeHtml(preview.targetRange)}
+            • ${escapeHtml(preview.sourceType)}
+            • ${escapeHtml(preview.provider)}
+            ${preview.overwriteRisk ? ` • overwrite ${escapeHtml(preview.overwriteRisk)}` : ""}
+            ${preview.confirmationLevel ? ` • ${escapeHtml(preview.confirmationLevel)}` : ""}
+          </div>
+          <div>${escapeHtml(preview.explanation)}</div>
+          <div class="preview-meta">${escapeHtml(preview.summary)}</div>
+          ${sourceDetails ? `<div class="preview-meta">${escapeHtml(sourceDetails)}</div>` : ""}
+          <pre class="formula-block">${escapeHtml(preview.formula)}</pre>
+          ${Array.isArray(preview.affectedRanges) && preview.affectedRanges.length > 0
+            ? `<div class="preview-meta">${escapeHtml(preview.affectedRanges.join(", "))}</div>`
+            : ""}
+          ${supportError ? `<div class="warning-line">${escapeHtml(supportError)}</div>` : ""}
+          ${getRequiresConfirmation(response) && !supportError ? `
+            <div class="preview-actions">
+              <button type="button" data-confirm-run="${escapeHtml(message.runId || "")}" data-request="${escapeHtml(message.requestId || "")}">
+                Confirm External Data
+              </button>
+            </div>
+          ` : ""}
+        </div>
+      `;
+    }
+
+    if (preview.kind === "sheet_update") {
+      return `
+        <div class="preview">
+          <div class="preview-meta">
+            ${escapeHtml(preview.targetSheet)}!${escapeHtml(preview.targetRange)}
+            • ${preview.shape.rows}x${preview.shape.columns}
+            • ${escapeHtml(preview.operation)}
+            • ${escapeHtml(preview.matrixKind)}
+            ${preview.overwriteRisk ? ` • overwrite ${escapeHtml(preview.overwriteRisk)}` : ""}
+          </div>
+          ${renderTable([], preview.rows)}
+          ${getRequiresConfirmation(response) ? `
+            <div class="preview-actions">
+              <button type="button" data-confirm-run="${escapeHtml(message.runId || "")}" data-request="${escapeHtml(message.requestId || "")}">
+                Confirm Update
+              </button>
+            </div>
+          ` : ""}
+        </div>
+      `;
+    }
+
+    if (preview.kind === "sheet_import_plan") {
+      return `
+        <div class="preview">
+          <div class="preview-meta">
+            ${escapeHtml(preview.targetSheet)}!${escapeHtml(preview.targetRange)}
+            • ${preview.shape.rows}x${preview.shape.columns}
+            • extraction ${escapeHtml(preview.extractionMode)}
+          </div>
+          ${renderTable(preview.headers, preview.rows)}
+          ${getRequiresConfirmation(response) ? `
+            <div class="preview-actions">
+              <button type="button" data-confirm-run="${escapeHtml(message.runId || "")}" data-request="${escapeHtml(message.requestId || "")}">
+                Confirm Insert
+              </button>
+            </div>
+          ` : ""}
+        </div>
+      `;
+    }
+
+    if (preview.kind === "extracted_table") {
+      return `
+        <div class="preview">
+          <div class="preview-meta">
+            Extracted table • ${preview.shape.rows}x${preview.shape.columns}
+            • extraction ${escapeHtml(preview.extractionMode)}
+          </div>
+          ${renderTable(preview.headers, preview.rows)}
+        </div>
+      `;
+    }
+
+    if (preview.kind === "attachment_analysis") {
+      return `
+        <div class="preview">
+          <div class="preview-meta">
+            Attachment analysis • ${escapeHtml(preview.contentKind)}
+            • extraction ${escapeHtml(preview.extractionMode)}
+          </div>
+        </div>
+      `;
+    }
+
+    if (preview.kind === "document_summary") {
+      return `
+        <div class="preview">
+          <div class="preview-meta">
+            Document summary • ${escapeHtml(preview.contentKind)}
+            • extraction ${escapeHtml(preview.extractionMode)}
+          </div>
+          ${preview.keyPoints.length > 0 ? `
+            <ul class="key-points">
+              ${preview.keyPoints.map((point) => `<li>${escapeHtml(point)}</li>`).join("")}
+            </ul>
+          ` : ""}
+        </div>
+      `;
+    }
+
+    return "";
+  }
+
+  function renderMessages() {
+    elements.messages.innerHTML = state.messages.map((message) => {
+      const response = message.response;
+      const content = response ? getResponseBodyText(response) : message.content;
+      const warnings = response ? getResponseWarnings(response) : [];
+      const suggestions = response ? getFollowUpSuggestions(response) : [];
+
+      return `
+        <section class="message ${message.role}">
+          <div class="bubble">${escapeHtml(content)}</div>
+          ${message.statusLine ? `<div class="status-line">${escapeHtml(message.statusLine)}</div>` : ""}
+          ${warnings.length > 0 ? renderWarnings(warnings) : ""}
+          ${response ? renderStructuredPreview(response, message) : ""}
+          ${renderSuggestions(suggestions)}
+        </section>
+      `;
+    }).join("");
+
+    elements.messages.querySelectorAll("[data-confirm-run]").forEach((button) => {
+      button.addEventListener("click", async () => {
+        const runId = button.getAttribute("data-confirm-run");
+        const requestId = button.getAttribute("data-request");
+        const message = state.messages.find((entry) => entry.runId === runId);
+        if (!message || !requestId || !runId || !message.response || !isWritePlanResponse(message.response)) {
+          return;
+        }
+
+        button.setAttribute("disabled", "true");
+        await executeWritePlanMessage(message);
+      });
+    });
+
+    elements.messages.querySelectorAll("[data-suggestion-index]").forEach((button) => {
+      button.addEventListener("click", () => {
+        const section = button.closest(".message");
+        const index = Number(button.getAttribute("data-suggestion-index"));
+        const messageIndex = Array.from(elements.messages.children).indexOf(section);
+        const message = state.messages[messageIndex];
+        const suggestions = message && message.response ? getFollowUpSuggestions(message.response) : [];
+        const suggestion = suggestions[index];
+        if (suggestion) {
+          elements.prompt.value = suggestion;
+          elements.prompt.focus();
+        }
+      });
+    });
+
+    elements.messages.scrollTop = elements.messages.scrollHeight;
+  }
+
+  async function uploadPendingAttachments() {
+    const uploads = [];
+    for (const attachment of state.pendingAttachments) {
+      if (attachment.uploadedAttachment) {
+        uploads.push(attachment.uploadedAttachment);
+        continue;
+      }
+
+      attachment.status = "Uploading";
+      renderAttachmentStrip();
+
+      try {
+        const payload = await callServer("uploadGatewayImageAttachment", {
+          fileName: attachment.fileName,
+          mimeType: attachment.file && attachment.file.type ? attachment.file.type : "application/octet-stream",
+          base64Data: await readFileAsBase64Data(attachment.file),
+          source: attachment.source,
+          sessionId: state.sessionId
+        });
+        attachment.uploadedAttachment = payload.attachment;
+        attachment.status = "Uploaded";
+        uploads.push(payload.attachment);
+        renderAttachmentStrip();
+      } catch (error) {
+        attachment.status = "Failed";
+        renderAttachmentStrip();
+        throw error;
+      }
+    }
+    return uploads;
+  }
+
+  function buildRequestEnvelope(input) {
+    const runtimeConfig = state.runtimeConfig || createDefaultRuntimeConfig();
+    return {
+      schemaVersion: "1.0.0",
+      requestId: createRequestId(),
+      source: {
+        channel: "google_sheets",
+        clientVersion: runtimeConfig.clientVersion,
+        sessionId: state.sessionId
+      },
+      host: input.snapshot.host,
+      userMessage: truncateRequestText(input.userMessage),
+      conversation: sanitizeConversation(input.conversation),
+      context: {
+        ...input.snapshot.context,
+        attachments: input.attachments.length > 0 ? input.attachments : undefined
+      },
+      capabilities: {
+        canRenderTrace: true,
+        canRenderStructuredPreview: true,
+        canConfirmWriteBack: true,
+        supportsImageInputs: true,
+        supportsWriteBackExecution: true,
+        supportsNoteWrites: true
+      },
+      reviewer: {
+        reviewerSafeMode: parseBooleanSetting(runtimeConfig.reviewerSafeMode),
+        forceExtractionMode: runtimeConfig.forceExtractionMode
+      },
+      confirmation: {
+        state: "none"
+      }
+    };
+  }
+
+  function cancelMessagePoll(message) {
+    if (message && message.pollTimerId != null) {
+      window.clearTimeout(message.pollTimerId);
+      message.pollTimerId = null;
+    }
+
+    if (message) {
+      message.pollingStopped = true;
+    }
+  }
+
+  function scheduleMessagePoll(message, delayMs = MESSAGE_POLL_INTERVAL_MS) {
+    if (!message || message.pollingStopped) {
+      return;
+    }
+
+    message.pollTimerId = window.setTimeout(() => {
+      message.pollTimerId = null;
+      void runMessagePoll(message);
+    }, delayMs);
+  }
+
+  async function runMessagePoll(message) {
+    if (!message || message.pollingStopped || message.pollingInFlight) {
+      return;
+    }
+
+    message.pollingInFlight = true;
+    message.pollAttemptCount = Number(message.pollAttemptCount || 0) + 1;
+
+    try {
+      if (ENABLE_LIVE_TRACE_POLLING && shouldPollTraceForMessage(message)) {
+        try {
+          const traceParams = [
+            `after=${encodeURIComponent(String(message.traceIndex || 0))}`
+          ];
+          if (message.requestId) {
+            traceParams.push(`requestId=${encodeURIComponent(message.requestId)}`);
+          }
+          const trace = await callGatewayJson(`/api/trace/${message.runId}?${traceParams.join("&")}`, {
+            allowProxyFallback: false
+          });
+          message.traceIndex = trace.nextIndex;
+          if (trace.events.length > 0) {
+            message.trace = trimMessageTraceEvents((message.trace || []).concat(trace.events));
+            message.statusLine = summarizeLatestTrace(message.trace);
+            renderMessages();
+          }
+        } catch (error) {
+          if (isTraceUnavailablePollError(error) || isTraceBandwidthPollError(error)) {
+            message.tracePollingDisabled = true;
+          } else {
+            throw error;
+          }
+        }
+      }
+
+      const runQuery = message.requestId
+        ? `?requestId=${encodeURIComponent(message.requestId)}&includeTrace=0`
+        : "?includeTrace=0";
+      const run = await callGatewayJson(`/api/requests/${message.runId}${runQuery}`, {
+        allowProxyFallback: false
+      });
+      if (run.status === "completed" && run.response) {
+        cancelMessagePoll(message);
+        setMessageResponse(message, run.response);
+        message.content = getResponseBodyText(message.response);
+        message.statusLine = summarizeLatestTrace(message.response.trace);
+        renderMessages();
+        return;
+      }
+
+      if (run.status === "failed") {
+        cancelMessagePoll(message);
+        message.content = run.error || "Hermes failed to process the request.";
+        message.statusLine = "Request failed";
+        renderMessages();
+        return;
+      }
+    } catch (error) {
+      cancelMessagePoll(message);
+      message.content = sanitizeHostExecutionError(error, "Failed while polling Hermes.");
+      message.statusLine = "Request failed";
+      renderMessages();
+      return;
+    } finally {
+      message.pollingInFlight = false;
+    }
+
+    message.pollDelayMs = getNextMessagePollDelay(message);
+    scheduleMessagePoll(message, message.pollDelayMs);
+  }
+
+  async function pollRun(message) {
+    cancelMessagePoll(message);
+    message.pollingInFlight = false;
+    message.pollingStopped = false;
+    message.pollAttemptCount = 0;
+    message.pollDelayMs = MESSAGE_POLL_INTERVAL_MS;
+    message.tracePollingDisabled = !ENABLE_LIVE_TRACE_POLLING;
+    scheduleMessagePoll(message);
+  }
+
+  function clearPendingAttachments() {
+    state.pendingAttachments.forEach((attachment) => {
+      if (attachment.previewUrl) {
+        URL.revokeObjectURL(attachment.previewUrl);
+      }
+    });
+    state.pendingAttachments = [];
+    renderAttachmentStrip();
+  }
+
+  function addPendingFiles(files, source) {
+    const supportedFiles = filterSupportedImageFiles(files);
+    supportedFiles.forEach((file) => {
+      state.pendingAttachments.push({
+        file,
+        fileName: file.name || `image-${Date.now()}.png`,
+        source,
+        status: "Ready",
+        previewUrl: URL.createObjectURL(file)
+      });
+    });
+    renderAttachmentStrip();
+  }
+
+  async function sendPrompt() {
+    const prompt = elements.prompt.value.trim();
+    if (!prompt) {
+      return;
+    }
+    const normalizedPrompt = truncateRequestText(prompt);
+
+    appendStoredMessage({ role: "user", content: prompt });
+    elements.prompt.value = "";
+
+    if (UNDER_SPECIFIED_AFFIRMATION_PATTERN.test(normalizedPrompt)) {
+      appendStoredMessage({
+        role: "assistant",
+        content: buildUnderSpecifiedFollowUpMessage(state.messages),
+        statusLine: "Need more detail",
+        requestId: "",
+        runId: "",
+        traceIndex: 0,
+        trace: [],
+        response: null
+      });
+      renderMessages();
+      return;
+    }
+
+    const executionShortcutMode = getExecutionShortcutMode(normalizedPrompt);
+
+    const pendingWritePlanMessage = getLatestPendingWritePlanMessage(prompt);
+    if (pendingWritePlanMessage) {
+      pendingWritePlanMessage.statusLine = "Applying approved update...";
+      renderMessages();
+      await executeWritePlanMessage(pendingWritePlanMessage);
+      return;
+    }
+
+    const assistantMessage = {
+      role: "assistant",
+      content: executionShortcutMode === "undo"
+        ? "Undoing the latest reversible write..."
+        : executionShortcutMode === "redo"
+          ? "Redoing the latest reversible write..."
+          : "Thinking...",
+      statusLine: executionShortcutMode
+        ? "Sending execution-control request to Hermes"
+        : "Sending request to Hermes",
+      requestId: "",
+      runId: "",
+      traceIndex: 0,
+      trace: [],
+      response: null
+    };
+    appendStoredMessage(assistantMessage);
+    renderMessages();
+
+    if (executionShortcutMode) {
+      try {
+        await handleExecutionShortcut(executionShortcutMode, assistantMessage);
+      } catch (error) {
+        assistantMessage.content = sanitizeHostExecutionError(
+          error,
+          executionShortcutMode === "undo" ? "Undo failed." : "Redo failed."
+        );
+        assistantMessage.statusLine = "Execution control failed";
+      }
+
+      renderMessages();
+      return;
+    }
+
+    try {
+      await ensureRuntimeConfig();
+      const [snapshot, attachments] = await Promise.all([
+        callServer("getSpreadsheetSnapshot", normalizedPrompt, state.sessionId),
+        uploadPendingAttachments()
+      ]);
+
+      const request = buildRequestEnvelope({
+        userMessage: normalizedPrompt,
+        conversation: state.messages,
+        snapshot,
+        attachments
+      });
+
+      assistantMessage.requestId = request.requestId;
+      const accepted = await callGatewayJson("/api/requests", {
+        method: "post",
+        headers: { "content-type": "application/json" },
+        body: request
+      });
+
+      assistantMessage.runId = accepted.runId;
+      assistantMessage.statusLine = "Thinking...";
+      clearPendingAttachments();
+      renderMessages();
+      await pollRun(assistantMessage);
+    } catch (error) {
+      assistantMessage.content = sanitizeHostExecutionError(error, "Failed to contact Hermes.");
+      assistantMessage.statusLine = "Request failed before Hermes could process it";
+      renderMessages();
+    }
+  }
+
+  function attachDragAndDrop() {
+    const suppress = (event) => {
+      event.preventDefault();
+      event.stopPropagation();
+    };
+
+    elements.app.addEventListener("dragover", suppress);
+    elements.app.addEventListener("drop", (event) => {
+      suppress(event);
+      const files = filterSupportedImageFiles(event.dataTransfer && event.dataTransfer.files || []);
+      if (files.length > 0) {
+        addPendingFiles(files, "drag_drop");
+      }
+    });
+  }
+
+  async function initialize() {
+    await ensureRuntimeConfig();
+    let prefill = null;
+    try {
+      prefill = await callServer("consumePrefillPrompt");
+    } catch (error) {
+      console.warn("Hermes could not load the prefill prompt.", error);
+    }
+    if (prefill) {
+      elements.prompt.value = prefill;
+    }
+
+    renderAttachmentStrip();
+    elements.sendButton.addEventListener("click", () => void sendPrompt());
+    elements.fileInput.addEventListener("change", (event) => {
+      addPendingFiles(event.target.files || [], "upload");
+      event.target.value = "";
+    });
+    elements.prompt.addEventListener("keydown", (event) => {
+      if (event.key === "Enter" && !event.shiftKey) {
+        event.preventDefault();
+        void sendPrompt();
+      }
+    });
+    window.addEventListener("paste", (event) => {
+      const files = filterSupportedImageFiles(event.clipboardData && event.clipboardData.files || []);
+      if (files.length > 0) {
+        addPendingFiles(files, "clipboard");
+      }
+    });
+    attachDragAndDrop();
+  }
+
+  initialize();
+</script>

@@ -1,0 +1,142 @@
+<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<OfficeApp
+  xmlns="http://schemas.microsoft.com/office/appforoffice/1.1"
+  xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+  xmlns:bt="http://schemas.microsoft.com/office/officeappbasictypes/1.0"
+  xmlns:ov="http://schemas.microsoft.com/office/taskpaneappversionoverrides"
+  xsi:type="TaskPaneApp">
+  <Id>7a4f17d1-a8cf-4f96-9dbe-05ebf29ee0b3</Id>
+  <Version>1.0.0.0</Version>
+  <ProviderName>Hermes Demo</ProviderName>
+  <DefaultLocale>en-US</DefaultLocale>
+  <DisplayName DefaultValue="Hermes Agent"/>
+  <Description DefaultValue="Chat-first spreadsheet assistant routed through remote Hermes."/>
+  <IconUrl DefaultValue="https://localhost:3000/apps/excel-addin/assets/icon-32.png"/>
+  <HighResolutionIconUrl DefaultValue="https://localhost:3000/apps/excel-addin/assets/icon-80.png"/>
+  <SupportUrl DefaultValue="https://example.com/hermes"/>
+  <AppDomains>
+    <AppDomain>https://localhost:3000</AppDomain>
+    <AppDomain>http://127.0.0.1:8787</AppDomain>
+  </AppDomains>
+  <Hosts>
+    <Host Name="Workbook"/>
+  </Hosts>
+  <Requirements>
+    <Sets DefaultMinVersion="1.1">
+      <Set Name="SharedRuntime" MinVersion="1.1"/>
+    </Sets>
+  </Requirements>
+  <DefaultSettings>
+    <SourceLocation DefaultValue="https://localhost:3000/apps/excel-addin/src/taskpane/taskpane.html"/>
+  </DefaultSettings>
+  <Permissions>ReadWriteDocument</Permissions>
+  <VersionOverrides xmlns="http://schemas.microsoft.com/office/taskpaneappversionoverrides" xsi:type="VersionOverridesV1_1">
+    <Hosts>
+      <Host xsi:type="Workbook">
+        <Runtimes>
+          <Runtime resid="Taskpane.Url" lifetime="long"/>
+        </Runtimes>
+        <DesktopFormFactor>
+          <FunctionFile resid="Taskpane.Url"/>
+          <ExtensionPoint xsi:type="PrimaryCommandSurface">
+            <OfficeTab id="TabHome">
+              <Group id="Hermes.Group">
+                <Label resid="Hermes.GroupLabel"/>
+                <Icon>
+                  <bt:Image size="16" resid="Hermes.Icon.16"/>
+                  <bt:Image size="32" resid="Hermes.Icon.32"/>
+                  <bt:Image size="80" resid="Hermes.Icon.80"/>
+                </Icon>
+                <Control xsi:type="Button" id="Hermes.Open">
+                  <Label resid="Hermes.OpenLabel"/>
+                  <Supertip>
+                    <Title resid="Hermes.OpenLabel"/>
+                    <Description resid="Hermes.OpenDescription"/>
+                  </Supertip>
+                  <Icon>
+                    <bt:Image size="16" resid="Hermes.Icon.16"/>
+                    <bt:Image size="32" resid="Hermes.Icon.32"/>
+                    <bt:Image size="80" resid="Hermes.Icon.80"/>
+                  </Icon>
+                  <Action xsi:type="ShowTaskpane">
+                    <TaskpaneId>Office.AutoShowTaskpaneWithDocument</TaskpaneId>
+                    <SourceLocation resid="Taskpane.Url"/>
+                  </Action>
+                </Control>
+                <Control xsi:type="Button" id="Hermes.ExplainSelection">
+                  <Label resid="Hermes.ExplainLabel"/>
+                  <Supertip>
+                    <Title resid="Hermes.ExplainLabel"/>
+                    <Description resid="Hermes.ExplainDescription"/>
+                  </Supertip>
+                  <Icon>
+                    <bt:Image size="16" resid="Hermes.Icon.16"/>
+                    <bt:Image size="32" resid="Hermes.Icon.32"/>
+                    <bt:Image size="80" resid="Hermes.Icon.80"/>
+                  </Icon>
+                  <Action xsi:type="ExecuteFunction">
+                    <FunctionName>explainSelection</FunctionName>
+                  </Action>
+                </Control>
+                <Control xsi:type="Button" id="Hermes.GenerateFormula">
+                  <Label resid="Hermes.FormulaLabel"/>
+                  <Supertip>
+                    <Title resid="Hermes.FormulaLabel"/>
+                    <Description resid="Hermes.FormulaDescription"/>
+                  </Supertip>
+                  <Icon>
+                    <bt:Image size="16" resid="Hermes.Icon.16"/>
+                    <bt:Image size="32" resid="Hermes.Icon.32"/>
+                    <bt:Image size="80" resid="Hermes.Icon.80"/>
+                  </Icon>
+                  <Action xsi:type="ExecuteFunction">
+                    <FunctionName>generateFormula</FunctionName>
+                  </Action>
+                </Control>
+                <Control xsi:type="Button" id="Hermes.InsertImage">
+                  <Label resid="Hermes.ImageLabel"/>
+                  <Supertip>
+                    <Title resid="Hermes.ImageLabel"/>
+                    <Description resid="Hermes.ImageDescription"/>
+                  </Supertip>
+                  <Icon>
+                    <bt:Image size="16" resid="Hermes.Icon.16"/>
+                    <bt:Image size="32" resid="Hermes.Icon.32"/>
+                    <bt:Image size="80" resid="Hermes.Icon.80"/>
+                  </Icon>
+                  <Action xsi:type="ExecuteFunction">
+                    <FunctionName>insertFromImage</FunctionName>
+                  </Action>
+                </Control>
+              </Group>
+            </OfficeTab>
+          </ExtensionPoint>
+        </DesktopFormFactor>
+      </Host>
+    </Hosts>
+    <Resources>
+      <bt:Images>
+        <bt:Image id="Hermes.Icon.16" DefaultValue="https://localhost:3000/apps/excel-addin/assets/icon-16.png"/>
+        <bt:Image id="Hermes.Icon.32" DefaultValue="https://localhost:3000/apps/excel-addin/assets/icon-32.png"/>
+        <bt:Image id="Hermes.Icon.80" DefaultValue="https://localhost:3000/apps/excel-addin/assets/icon-80.png"/>
+      </bt:Images>
+      <bt:Urls>
+        <bt:Url id="Commands.Url" DefaultValue="https://localhost:3000/apps/excel-addin/src/commands/commands.html"/>
+        <bt:Url id="Taskpane.Url" DefaultValue="https://localhost:3000/apps/excel-addin/src/taskpane/taskpane.html"/>
+      </bt:Urls>
+      <bt:ShortStrings>
+        <bt:String id="Hermes.GroupLabel" DefaultValue="Hermes"/>
+        <bt:String id="Hermes.OpenLabel" DefaultValue="Open Hermes"/>
+        <bt:String id="Hermes.ExplainLabel" DefaultValue="Explain Selection"/>
+        <bt:String id="Hermes.FormulaLabel" DefaultValue="Generate Formula"/>
+        <bt:String id="Hermes.ImageLabel" DefaultValue="Insert From Image"/>
+      </bt:ShortStrings>
+      <bt:LongStrings>
+        <bt:String id="Hermes.OpenDescription" DefaultValue="Open the Hermes Agent task pane."/>
+        <bt:String id="Hermes.ExplainDescription" DefaultValue="Ask Hermes about the current selection."/>
+        <bt:String id="Hermes.FormulaDescription" DefaultValue="Ask Hermes for a formula suggestion."/>
+        <bt:String id="Hermes.ImageDescription" DefaultValue="Extract a table from an image through Hermes."/>
+      </bt:LongStrings>
+    </Resources>
+  </VersionOverrides>
+</OfficeApp>

@@ -1,0 +1,26 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Hermes Agent</title>
+    <link rel="stylesheet" href="./taskpane.css" />
+    <script src="https://appsforoffice.microsoft.com/lib/1/hosted/office.js"></script>
+    <script type="module" src="./taskpane.js?v=20260423w"></script>
+  </head>
+  <body>
+    <div id="app" class="shell">
+      <header class="header">Hermes Agent</header>
+      <main id="messages" class="messages"></main>
+      <section id="composer" class="composer">
+        <div id="attachment-strip" class="attachment-strip"></div>
+        <div class="input-row">
+          <label class="attach-button" for="file-input">+</label>
+          <input id="file-input" class="hidden-input" type="file" accept=".png,.jpg,.jpeg,.webp,image/png,image/jpeg,image/webp" />
+          <textarea id="prompt" rows="2" placeholder="Ask Hermes about this sheet"></textarea>
+          <button id="send-button" type="button">Send</button>
+        </div>
+      </section>
+    </div>
+  </body>
+</html>

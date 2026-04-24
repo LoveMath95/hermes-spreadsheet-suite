@@ -1,0 +1,23 @@
+<!doctype html>
+<html>
+  <head>
+    <base target="_top">
+    <?!= include_('html/Sidebar.css'); ?>
+  </head>
+  <body>
+    <div id="app" class="shell">
+      <header class="header">Hermes</header>
+      <main id="messages" class="messages"></main>
+      <section class="composer">
+        <div id="attachment-strip" class="attachment-strip"></div>
+        <div class="input-row">
+          <label class="attach-button" for="file-input">+</label>
+          <input id="file-input" class="hidden-input" type="file" accept=".png,.jpg,.jpeg,.webp,image/png,image/jpeg,image/webp" />
+          <textarea id="prompt" rows="2" placeholder="Ask Hermes about this sheet"></textarea>
+          <button id="send-button" type="button">Send</button>
+        </div>
+      </section>
+    </div>
+    <?!= include_('html/Sidebar.js'); ?>
+  </body>
+</html>

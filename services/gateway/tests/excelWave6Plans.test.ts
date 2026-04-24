@@ -1,0 +1,2379 @@
+import { afterEach, describe, expect, it, vi } from "vitest";
+
+const TASKPANE_MODULE_URL = new URL(
+  "../../../apps/excel-addin/src/taskpane/taskpane.js",
+  import.meta.url
+).href;
+let taskpaneUuidCounter = 0;
+
+function createElementStub() {
+  const listeners = new Map<string, Array<(event?: unknown) => void>>();
+
+  return {
+    innerHTML: "",
+    value: "",
+    scrollTop: 0,
+    scrollHeight: 0,
+    clientHeight: 0,
+    children: [],
+    addEventListener(type: string, listener: (event?: unknown) => void) {
+      listeners.set(type, [...(listeners.get(type) ?? []), listener]);
+    },
+    dispatch(type: string, event?: unknown) {
+      for (const listener of listeners.get(type) ?? []) {
+        listener(event);
+      }
+    },
+    querySelectorAll() {
+      return [];
+    },
+    focus() {},
+    closest() {
+      return null;
+    },
+    setAttribute() {},
+    getAttribute() {
+      return null;
+    }
+  };
+}
+
+async function loadTaskpaneModule(
+  excelContext: Record<string, unknown>,
+  options?: {
+    documentUrl?: string;
+    documentSettings?: Map<string, unknown>;
+    disableDocumentSettings?: boolean;
+    disableRandomUUID?: boolean;
+    fetchImpl?: ReturnType<typeof vi.fn>;
+    locationSearch?: string;
+    localStorageSeed?: Record<string, string>;
+    throwOnLocalStorageAccess?: boolean;
+    sessionStorageSeed?: Record<string, string>;
+    addinSetStartupBehavior?: ReturnType<typeof vi.fn>;
+  }
+) {
+  vi.resetModules();
+
+  const elements = new Map([
+    ["app", createElementStub()],
+    ["messages", createElementStub()],
+    ["prompt", createElementStub()],
+    ["send-button", createElementStub()],
+    ["file-input", createElementStub()],
+    ["attachment-strip", createElementStub()]
+  ]);
+
+  const storage = new Map<string, string>();
+  for (const [key, value] of Object.entries(options?.localStorageSeed ?? {})) {
+    storage.set(key, value);
+  }
+  const sessionStorageBacking = new Map<string, string>();
+  for (const [key, value] of Object.entries(options?.sessionStorageSeed ?? {})) {
+    sessionStorageBacking.set(key, value);
+  }
+  const documentSettings = options?.documentSettings ?? new Map<string, unknown>();
+  const localStorage = {
+    getItem(key: string) {
+      if (options?.throwOnLocalStorageAccess) {
+        throw new Error("localStorage blocked");
+      }
+      return storage.get(key) ?? null;
+    },
+    setItem(key: string, value: string) {
+      if (options?.throwOnLocalStorageAccess) {
+        throw new Error("localStorage blocked");
+      }
+      storage.set(key, value);
+    },
+    removeItem(key: string) {
+      if (options?.throwOnLocalStorageAccess) {
+        throw new Error("localStorage blocked");
+      }
+      storage.delete(key);
+    }
+  };
+  const sessionStorage = {
+    getItem(key: string) {
+      return sessionStorageBacking.get(key) ?? null;
+    },
+    setItem(key: string, value: string) {
+      sessionStorageBacking.set(key, value);
+    },
+    removeItem(key: string) {
+      sessionStorageBacking.delete(key);
+    }
+  };
+
+  vi.stubGlobal("window", {
+    location: { search: options?.locationSearch ?? "" },
+    localStorage,
+    sessionStorage,
+    addEventListener() {},
+    setInterval,
+    clearInterval,
+    setTimeout,
+    clearTimeout
+  });
+  vi.stubGlobal("document", {
+    getElementById(id: string) {
+      return elements.get(id) ?? createElementStub();
+    }
+  });
+  vi.stubGlobal("fetch", options?.fetchImpl ?? vi.fn());
+  vi.stubGlobal("crypto", options?.disableRandomUUID
+    ? {}
+    : {
+        randomUUID() {
+          taskpaneUuidCounter += 1;
+          return `test-uuid-${taskpaneUuidCounter}`;
+        }
+      });
+  vi.stubGlobal("Office", {
+    PlatformType: { Mac: "Mac" },
+    AsyncResultStatus: { Succeeded: "succeeded" },
+    context: {
+      platform: "PC",
+      diagnostics: { version: "test-client" },
+      document: {
+        url: options?.documentUrl ?? "https://example.test/Budget.xlsx",
+        settings: options?.disableDocumentSettings
+          ? undefined
+          : {
+              get(key: string) {
+                return documentSettings.get(key) ?? null;
+              },
+              set(key: string, value: unknown) {
+                documentSettings.set(key, value);
+              },
+              remove(key: string) {
+                documentSettings.delete(key);
+              },
+              saveAsync(callback?: (result: { status: string; error?: unknown }) => void) {
+                callback?.({ status: "succeeded" });
+              }
+            }
+      },
+      displayLanguage: "en-US"
+    },
+    addin: options?.addinSetStartupBehavior
+      ? {
+          setStartupBehavior: options.addinSetStartupBehavior
+        }
+      : undefined,
+    StartupBehavior: {
+      load: "load"
+    },
+    onReady() {}
+  });
+  vi.stubGlobal("Excel", {
+    run: async (callback: (context: Record<string, unknown>) => unknown) => callback(excelContext),
+    RangeCopyType: {
+      formulas: "Formulas",
+      formats: "Formats"
+    },
+    SheetVisibility: {
+      visible: "visible",
+      hidden: "hidden",
+      veryHidden: "veryHidden"
+    },
+    WorksheetPositionType: {
+      beginning: "beginning",
+      end: "end",
+      before: "before"
+    }
+  });
+
+  return import(`${TASKPANE_MODULE_URL}?t=${Date.now()}_${Math.random()}`);
+}
+
+afterEach(() => {
+  vi.useRealTimers();
+  vi.unstubAllGlobals();
+  vi.restoreAllMocks();
+});
+
+describe("Excel wave 6 composite plans and execution controls", () => {
+  it("sanitizes host execution failures into user-facing guidance", async () => {
+    const taskpane = await loadTaskpaneModule({
+      sync: vi.fn(async () => {})
+    });
+
+    expect(taskpane.sanitizeHostExecutionError(
+      new Error("The approved targetRange does not match the proposed shape.")
+    )).toBe(
+      "The spreadsheet changed, so the approved destination no longer matches the intended shape.\n\n" +
+      "Refresh the spreadsheet state and run the request again."
+    );
+
+    expect(taskpane.sanitizeHostExecutionError(
+      new Error("Target sheet not found: Sales Pivot")
+    )).toBe(
+      "Sheet \"Sales Pivot\" was not found.\n\nCreate or select that sheet, then retry."
+    );
+
+    expect(taskpane.sanitizeHostExecutionError(
+      new Error("Excel host does not support filter combiners other than and.")
+    )).toBe(
+      "This spreadsheet app cannot combine those filter conditions in one exact step.\n\n" +
+      "Use a single filter rule per column, or split the filter into smaller steps."
+    );
+
+    expect(taskpane.sanitizeHostExecutionError(
+      new Error("Cannot hide the only visible worksheet.")
+    )).toBe(
+      "At least one worksheet must stay visible.\n\n" +
+      "Keep another sheet visible or unhide one first, then retry."
+    );
+
+    expect(taskpane.sanitizeHostExecutionError(
+      new Error("Excel host does not support named ranges on this scope.")
+    )).toBe(
+      "This named range action is not supported in this spreadsheet app.\n\n" +
+      "Use a workbook-level named range or ask Hermes for a simpler named range update."
+    );
+
+    expect(taskpane.sanitizeHostExecutionError(
+      new Error("Hermes Agent returned a response body that does not match the structured gateway contract.")
+    )).toBe(
+      "The Hermes service returned a response the add-in could not use.\n\n" +
+      "Retry the request. If it keeps happening, reload the add-in or check the Hermes gateway."
+    );
+
+    expect(taskpane.sanitizeHostExecutionError(
+      new Error("Excel host does not support exact conditional-format mapping for ruleType color_scale.")
+    )).toBe(
+      "This conditional formatting step is not supported here.\n\n" +
+      "Try a simpler highlight rule, or ask Hermes for a preview-only result first."
+    );
+
+    expect(taskpane.sanitizeHostExecutionError(
+      new Error("The requested resource doesn't exist.")
+    )).toBe(
+      "Hermes could not read the current workbook or selection.\n\n" +
+      "Select a normal worksheet cell, reload the add-in, and retry. If it keeps happening, reopen the workbook in Excel and try again."
+    );
+  });
+
+  it("formats gateway request issue paths into a visible request-details summary", async () => {
+    const taskpane = await loadTaskpaneModule({
+      sync: vi.fn(async () => {})
+    });
+
+    expect(taskpane.appendGatewayIssueSummary(
+      "Hermes couldn't prepare a valid request from the current spreadsheet state.\n\nRefresh the sheet state and try again.",
+      [
+        {
+          path: "context.selection.headers",
+          message: "headers.length must match selection.range width."
+        }
+      ]
+    )).toBe(
+      "Hermes couldn't prepare a valid request from the current spreadsheet state.\n\n" +
+      "Refresh the sheet state and try again.\n\n" +
+      "Request details:\n" +
+      "context.selection.headers: headers.length must match selection.range width."
+    );
+  });
+
+  it("scrolls the Excel message list to the latest message after render work completes", async () => {
+    const taskpane = await loadTaskpaneModule({
+      sync: vi.fn(async () => {})
+    });
+    const messagesElement = document.getElementById("messages") as {
+      scrollTop: number;
+      scrollHeight: number;
+      lastElementChild?: { scrollIntoView?: ReturnType<typeof vi.fn> };
+    };
+    const scrollIntoView = vi.fn();
+    const raf = vi.fn((callback: FrameRequestCallback) => {
+      callback(0);
+      return 1;
+    });
+
+    messagesElement.scrollTop = 0;
+    messagesElement.scrollHeight = 480;
+    messagesElement.lastElementChild = { scrollIntoView };
+    (window as typeof window & { requestAnimationFrame?: typeof raf }).requestAnimationFrame = raf;
+
+    taskpane.scrollMessagesToBottom();
+
+    expect(messagesElement.scrollTop).toBe(480);
+    expect(raf).toHaveBeenCalled();
+    expect(scrollIntoView).toHaveBeenCalled();
+  });
+
+  it("caps stored Excel messages and per-message trace history to keep long sessions responsive", async () => {
+    const taskpane = await loadTaskpaneModule({
+      sync: vi.fn(async () => {})
+    });
+
+    const messages = Array.from({ length: 130 }, (_, index) => ({
+      role: index % 2 === 0 ? "user" : "assistant",
+      content: `message_${index}`
+    }));
+    const traces = Array.from({ length: 260 }, (_, index) => ({
+      event: "result_generated",
+      timestamp: `2026-04-22T00:00:${String(index % 60).padStart(2, "0")}.000Z`,
+      label: `trace_${index}`
+    }));
+
+    const trimmedMessages = taskpane.pruneStoredMessages(messages);
+    const trimmedTrace = taskpane.trimMessageTraceEvents(traces);
+
+    expect(trimmedMessages).toHaveLength(100);
+    expect(trimmedMessages[0].content).toBe("message_30");
+    expect(trimmedMessages.at(-1)?.content).toBe("message_129");
+    expect(trimmedTrace).toHaveLength(200);
+    expect(trimmedTrace[0].label).toBe("trace_60");
+    expect(trimmedTrace.at(-1)?.label).toBe("trace_259");
+  });
+
+  it("does not overlap Excel poll requests when a previous poll is still in flight", async () => {
+    vi.useFakeTimers();
+    const fetchMock = vi.fn(() => new Promise(() => {}));
+    const taskpane = await loadTaskpaneModule({
+      sync: vi.fn(async () => {})
+    }, {
+      fetchImpl: fetchMock
+    });
+
+    void taskpane.pollRun({
+      runId: "run_poll_001",
+      requestId: "req_poll_001",
+      traceIndex: 0,
+      trace: [],
+      statusLine: "Thinking...",
+      content: "Thinking..."
+    });
+
+    await vi.advanceTimersByTimeAsync(900);
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+
+    await vi.advanceTimersByTimeAsync(5000);
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+  });
+
+  it("loads the Excel taskpane without crypto.randomUUID and still creates request ids", async () => {
+    const taskpane = await loadTaskpaneModule({
+      sync: vi.fn(async () => {})
+    }, {
+      disableRandomUUID: true
+    });
+
+    const request = taskpane.buildRequestEnvelope({
+      userMessage: "Explain this selection",
+      conversation: [{ role: "user", content: "Explain this selection" }],
+      snapshot: {
+        source: {
+          channel: "excel_windows",
+          clientVersion: "test-client",
+          sessionId: "sess_test"
+        },
+        host: {
+          platform: "excel_windows",
+          workbookTitle: "Budget.xlsx",
+          activeSheet: "Sheet1"
+        },
+        context: {}
+      },
+      attachments: []
+    });
+
+    expect(request.requestId).toMatch(/^req_/);
+  });
+
+  it("loads the Excel taskpane when localStorage access is blocked", async () => {
+    const taskpane = await loadTaskpaneModule({
+      sync: vi.fn(async () => {})
+    }, {
+      throwOnLocalStorageAccess: true
+    });
+
+    const request = taskpane.buildRequestEnvelope({
+      userMessage: "Summarize this table",
+      conversation: [{ role: "user", content: "Summarize this table" }],
+      snapshot: {
+        source: {
+          channel: "excel_windows",
+          clientVersion: "test-client",
+          sessionId: "sess_test"
+        },
+        host: {
+          platform: "excel_windows",
+          workbookTitle: "Budget.xlsx",
+          activeSheet: "Sheet1"
+        },
+        context: {}
+      },
+      attachments: []
+    });
+
+    expect(request.requestId).toMatch(/^req_/);
+    expect(request.source.sessionId).toMatch(/^sess_/);
+  });
+
+  it("routes natural-language undo prompts to execution control instead of sending them through the model", async () => {
+    const workbookSessionId = "workbook-123";
+    const workbookSessionKey = `excel_windows::${workbookSessionId}`;
+    const snapshotStoreKey = `Hermes.ReversibleExecutions.v1::${workbookSessionKey}`;
+    const localSnapshotStore = JSON.stringify({
+      version: 1,
+      order: ["exec_001"],
+      executions: {
+        exec_001: {
+          baseExecutionId: "exec_001"
+        }
+      },
+      bases: {
+        exec_001: {
+          baseExecutionId: "exec_001",
+          targetSheet: "Sheet8",
+          targetRange: "A1",
+          beforeCells: [[{ kind: "value", value: { type: "string", value: "before" } }]],
+          afterCells: [[{ kind: "value", value: { type: "string", value: "after" } }]]
+        }
+      }
+    });
+
+    const fetchMock = vi.fn(async (url: string, init?: { body?: string }) => ({
+      ok: true,
+      async json() {
+        if (url.includes("/api/execution/history")) {
+          return {
+            entries: [
+              {
+                executionId: "exec_001",
+                requestId: "req_001",
+                runId: "run_001",
+                planType: "sheet_update",
+                planDigest: "digest_001",
+                status: "completed",
+                timestamp: "2099-01-01T00:00:00.000Z",
+                reversible: true,
+                undoEligible: true,
+                redoEligible: false,
+                summary: "Write applied to Sheet8!A1."
+              }
+            ]
+          };
+        }
+
+        if (url.endsWith("/api/execution/undo")) {
+          return {
+            kind: "composite_update",
+            operation: "composite_update",
+            hostPlatform: "excel_windows",
+            executionId: "exec_undo_001",
+            stepResults: [],
+            summary: "Undid Sheet8!A1."
+          };
+        }
+
+        throw new Error(`Unexpected fetch URL: ${url}`);
+      }
+    }));
+
+    const appliedCells: Array<{ kind: string; value: unknown }> = [];
+    const targetRange = {
+      rowCount: 1,
+      columnCount: 1,
+      load() {},
+      getCell() {
+        return {
+          set formulas(value: unknown) {
+            appliedCells.push({ kind: "formula", value });
+          },
+          set values(value: unknown) {
+            appliedCells.push({ kind: "value", value });
+          }
+        };
+      }
+    };
+
+    const taskpane = await loadTaskpaneModule(
+      {
+        sync: vi.fn(async () => {}),
+        workbook: {
+          worksheets: {
+            getItem() {
+              return {
+                getRange() {
+                  return targetRange;
+                }
+              };
+            }
+          }
+        }
+      },
+      {
+        fetchImpl: fetchMock,
+        documentSettings: new Map([["Hermes.WorkbookSessionId", workbookSessionId]]),
+        localStorageSeed: {
+          [snapshotStoreKey]: localSnapshotStore
+        }
+      }
+    );
+
+    document.getElementById("prompt").value = "undo";
+    await taskpane.sendPrompt();
+
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+    expect(fetchMock.mock.calls[0][0]).toBe(
+      `http://127.0.0.1:8787/api/execution/history?workbookSessionKey=${encodeURIComponent(workbookSessionKey)}&limit=20`
+    );
+    expect(fetchMock.mock.calls[1][0]).toBe("http://127.0.0.1:8787/api/execution/undo");
+    expect(JSON.parse(String(fetchMock.mock.calls[1][1]?.body))).toMatchObject({
+      executionId: "exec_001",
+      workbookSessionKey
+    });
+    expect(appliedCells).toEqual([
+      { kind: "value", value: [["before"]] }
+    ]);
+    expect(document.getElementById("messages").innerHTML).toContain("Undid Sheet8!A1.");
+  });
+
+  it("handles bare affirmations locally instead of sending an under-specified follow-up back through the model", async () => {
+    const fetchMock = vi.fn();
+    const taskpane = await loadTaskpaneModule({
+      sync: vi.fn(async () => {})
+    }, {
+      fetchImpl: fetchMock
+    });
+
+    taskpane.appendStoredMessage({
+      role: "assistant",
+      content: "If you want, ask me to restore a specific range by describing what should be put back in Sheet8!A1:K33."
+    });
+    document.getElementById("prompt").value = "yep";
+
+    await taskpane.sendPrompt();
+
+    expect(fetchMock).not.toHaveBeenCalled();
+    expect(document.getElementById("messages").innerHTML).toContain(
+      "I still need the exact range, cell, sheet, or action you want me to apply."
+    );
+  });
+
+  it("renders message status lines so confirm-path host errors are visible in the sidebar", async () => {
+    const taskpane = await loadTaskpaneModule({
+      sync: vi.fn(async () => {})
+    });
+
+    taskpane.appendStoredMessage({
+      role: "assistant",
+      content: "Prepared a chart preview for Sheet1!A78.",
+      statusLine: "Write-back failed."
+    });
+    taskpane.renderMessages();
+
+    expect(document.getElementById("messages").innerHTML).toContain("Write-back failed.");
+  });
+
+  it("retries Excel writeback completion without reapplying the local change", async () => {
+    let completeAttempts = 0;
+    const fetchMock = vi.fn(async (url: string) => {
+      if (url === "http://gateway.test/api/writeback/approve") {
+        return new Response(JSON.stringify({
+          approvalToken: "approval-token",
+          planDigest: "plan-digest",
+          executionId: "exec_retry_001"
+        }), {
+          status: 200,
+          headers: { "content-type": "application/json" }
+        });
+      }
+
+      if (url === "http://gateway.test/api/writeback/complete") {
+        completeAttempts += 1;
+        if (completeAttempts === 1) {
+          return new Response(JSON.stringify({
+            error: {
+              message: "Temporary completion failure."
+            }
+          }), {
+            status: 500,
+            headers: { "content-type": "application/json" }
+          });
+        }
+
+        return new Response(JSON.stringify({ ok: true }), {
+          status: 200,
+          headers: { "content-type": "application/json" }
+        });
+      }
+
+      throw new Error(`Unexpected fetch URL: ${url}`);
+    });
+
+    const worksheets = {
+      items: [
+        { name: "Sheet1", position: 0, visibility: "visible" }
+      ],
+      load: vi.fn(),
+      add: vi.fn((name: string) => ({ name, position: 1, visibility: "visible" }))
+    };
+    const sync = vi.fn(async () => {});
+    const taskpane = await loadTaskpaneModule({
+      sync,
+      workbook: { worksheets }
+    }, {
+      fetchImpl: fetchMock,
+      locationSearch: "?gateway=http%3A%2F%2Fgateway.test"
+    });
+
+    const message = {
+      role: "assistant",
+      requestId: "req_confirm_retry_001",
+      runId: "run_confirm_retry_001",
+      response: {
+        type: "workbook_structure_update",
+        data: {
+          operation: "create_sheet",
+          sheetName: "Retry Demo",
+          explanation: "Create a new sheet named Retry Demo.",
+          confidence: 0.99,
+          requiresConfirmation: true
+        }
+      },
+      content: "Prepared a workbook update to create sheet Retry Demo.",
+      statusLine: "",
+      traceIndex: 0,
+      trace: []
+    };
+
+    await taskpane.executeWritePlanMessage(message);
+
+    expect(worksheets.add).toHaveBeenCalledTimes(1);
+    expect(fetchMock.mock.calls.map(([url]) => url)).toEqual([
+      "http://gateway.test/api/writeback/approve",
+      "http://gateway.test/api/writeback/complete"
+    ]);
+    expect(message.statusLine).toBe(
+      "Applied locally. Retry confirm to finish syncing Hermes history."
+    );
+    expect(message.pendingCompletion).toMatchObject({
+      requestId: "req_confirm_retry_001",
+      runId: "run_confirm_retry_001",
+      approvalToken: "approval-token",
+      planDigest: "plan-digest"
+    });
+
+    await taskpane.executeWritePlanMessage(message);
+
+    expect(worksheets.add).toHaveBeenCalledTimes(1);
+    expect(fetchMock.mock.calls.map(([url]) => url)).toEqual([
+      "http://gateway.test/api/writeback/approve",
+      "http://gateway.test/api/writeback/complete",
+      "http://gateway.test/api/writeback/complete"
+    ]);
+    expect(message).toMatchObject({
+      content: "Created sheet Retry Demo.",
+      response: null,
+      statusLine: ""
+    });
+    expect(message.pendingCompletion).toBeUndefined();
+  });
+  it("keeps polling the run when the trace has already expired", async () => {
+    vi.useFakeTimers();
+    const fetchMock = vi.fn()
+      .mockResolvedValueOnce(new Response(JSON.stringify({
+        error: {
+          code: "RUN_NOT_FOUND",
+          message: "That Hermes trace is no longer available.",
+          userAction: "Send the request again from the spreadsheet if you need a fresh trace."
+        }
+      }), {
+        status: 404,
+        headers: { "content-type": "application/json" }
+      }))
+      .mockResolvedValueOnce(new Response(JSON.stringify({
+        runId: "run_poll_trace_gone_001",
+        requestId: "req_poll_trace_gone_001",
+        status: "completed",
+        response: {
+          schemaVersion: "1.0.0",
+          requestId: "req_poll_trace_gone_001",
+          hermesRunId: "run_poll_trace_gone_001",
+          processedBy: "hermes",
+          serviceLabel: "hermes-gateway-local",
+          environmentLabel: "local-dev",
+          startedAt: "2026-04-22T00:00:00.000Z",
+          completedAt: "2026-04-22T00:00:01.000Z",
+          durationMs: 1000,
+          skillsUsed: [],
+          downstreamProvider: null,
+          warnings: [],
+          trace: [],
+          ui: {
+            displayMode: "inline",
+            showTrace: true,
+            showWarnings: true,
+            showConfidence: true,
+            showRequiresConfirmation: false
+          },
+          type: "chat",
+          data: {
+            message: "Done."
+          }
+        }
+      }), {
+        status: 200,
+        headers: { "content-type": "application/json" }
+      }));
+
+    const taskpane = await loadTaskpaneModule({
+      sync: vi.fn(async () => {})
+    }, {
+      fetchImpl: fetchMock
+    });
+
+    const message = {
+      runId: "run_poll_trace_gone_001",
+      requestId: "req_poll_trace_gone_001",
+      traceIndex: 0,
+      trace: [],
+      statusLine: "Thinking...",
+      content: "Thinking..."
+    };
+
+    void taskpane.pollRun(message);
+
+    await vi.advanceTimersByTimeAsync(900);
+
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+    expect(message.content).toBe("Done.");
+    expect(message.statusLine).not.toContain("trace is no longer available");
+    expect(message.statusLine).not.toContain("Request failed");
+    expect(message.response?.type).toBe("chat");
+  });
+
+  it("keeps polling the run when Excel trace polling hits bandwidth quota and disables live trace polling", async () => {
+    vi.useFakeTimers();
+    const fetchMock = vi.fn()
+      .mockRejectedValueOnce(
+        new Error(
+          "Exception: Bandwidth quota exceeded: https://gateway.test/api/trace/run_poll_quota_001?after=0. Try reducing the rate of data transfer."
+        )
+      )
+      .mockResolvedValueOnce(new Response(JSON.stringify({
+        runId: "run_poll_quota_001",
+        requestId: "req_poll_quota_001",
+        status: "completed",
+        response: {
+          schemaVersion: "1.0.0",
+          requestId: "req_poll_quota_001",
+          hermesRunId: "run_poll_quota_001",
+          processedBy: "hermes",
+          serviceLabel: "hermes-gateway-local",
+          environmentLabel: "local-dev",
+          startedAt: "2026-04-22T00:00:00.000Z",
+          completedAt: "2026-04-22T00:00:01.000Z",
+          durationMs: 1000,
+          skillsUsed: [],
+          downstreamProvider: null,
+          warnings: [],
+          trace: [],
+          ui: {
+            displayMode: "inline",
+            showTrace: true,
+            showWarnings: true,
+            showConfidence: true,
+            showRequiresConfirmation: false
+          },
+          type: "chat",
+          data: {
+            message: "Done."
+          }
+        }
+      }), {
+        status: 200,
+        headers: { "content-type": "application/json" }
+      }));
+
+    const taskpane = await loadTaskpaneModule({
+      sync: vi.fn(async () => {})
+    }, {
+      fetchImpl: fetchMock
+    });
+
+    const message = {
+      runId: "run_poll_quota_001",
+      requestId: "req_poll_quota_001",
+      traceIndex: 0,
+      trace: [],
+      statusLine: "Thinking...",
+      content: "Thinking..."
+    };
+
+    void taskpane.pollRun(message);
+
+    await vi.advanceTimersByTimeAsync(900);
+
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+    expect(message.content).toBe("Done.");
+    expect(message.statusLine).not.toContain("Request failed");
+    expect(message.tracePollingDisabled).toBe(true);
+    expect(message.response?.type).toBe("chat");
+  });
+
+  it("truncates oversized prompt and conversation content before building the Excel request envelope", async () => {
+    const taskpane = await loadTaskpaneModule({
+      sync: vi.fn(async () => {})
+    });
+    const oversized = "x".repeat(16_050);
+
+    const request = taskpane.buildRequestEnvelope({
+      userMessage: oversized,
+      conversation: [
+        { role: "assistant", content: oversized },
+        { role: "user", content: "short" }
+      ],
+      snapshot: {
+        source: {
+          channel: "excel_windows",
+          clientVersion: "test-client",
+          sessionId: "sess_test"
+        },
+        host: {
+          platform: "excel_windows",
+          workbookTitle: "Budget.xlsx",
+          activeSheet: "Sheet1"
+        },
+        context: {}
+      },
+      attachments: []
+    });
+
+    expect(request.userMessage).toHaveLength(16_000);
+    expect(request.userMessage.endsWith("...")).toBe(true);
+    expect(request.conversation[0].content).toHaveLength(16_000);
+    expect(request.conversation[0].content.endsWith("...")).toBe(true);
+  });
+
+  it("truncates oversized Excel spreadsheet-context strings before building the host snapshot", async () => {
+    const longHeader = "H".repeat(300);
+    const longValue = "V".repeat(4500);
+    const longFormula = `=${"A".repeat(17000)}`;
+    const selectionRange = {
+      address: "Sheet1!A1:B2",
+      values: [
+        [longHeader, "Revenue"],
+        [longValue, 123]
+      ],
+      formulas: [
+        ["", ""],
+        [longFormula, ""]
+      ],
+      load: vi.fn()
+    };
+    const currentRegion = {
+      address: "Sheet1!A1:B2",
+      values: selectionRange.values,
+      formulas: selectionRange.formulas,
+      load: vi.fn()
+    };
+    const activeCell = {
+      address: "Sheet1!A2",
+      values: [[longValue]],
+      formulas: [[longFormula]],
+      load: vi.fn(),
+      getSurroundingRegion: vi.fn(() => currentRegion)
+    };
+    const headerRange = {
+      values: [[longHeader, "Revenue"]],
+      load: vi.fn()
+    };
+    const sheet = {
+      name: "Sheet1",
+      load: vi.fn(),
+      getRange: vi.fn(() => headerRange)
+    };
+
+    const taskpane = await loadTaskpaneModule({
+      sync: vi.fn(async () => {}),
+      workbook: {
+        getSelectedRange() {
+          return selectionRange;
+        },
+        getActiveCell() {
+          return activeCell;
+        },
+        worksheets: {
+          getActiveWorksheet() {
+            return sheet;
+          }
+        }
+      }
+    });
+
+    const snapshot = await taskpane.getSpreadsheetSnapshot("Explain the current selection");
+
+    expect(snapshot.context.selection.headers?.[0]).toHaveLength(256);
+    expect(snapshot.context.selection.headers?.[0].endsWith("…")).toBe(true);
+    expect(String(snapshot.context.selection.values?.[1]?.[0])).toHaveLength(4000);
+    expect(String(snapshot.context.selection.values?.[1]?.[0]).endsWith("…")).toBe(true);
+    expect(snapshot.context.selection.formulas?.[1]?.[0]).toHaveLength(16000);
+    expect(snapshot.context.selection.formulas?.[1]?.[0]?.endsWith("…")).toBe(true);
+    expect(String(snapshot.context.activeCell?.displayValue)).toHaveLength(4000);
+    expect(String(snapshot.context.activeCell?.displayValue).endsWith("…")).toBe(true);
+    expect(snapshot.context.activeCell?.formula).toHaveLength(16000);
+    expect(snapshot.context.activeCell?.formula?.endsWith("…")).toBe(true);
+  });
+
+  it("keeps following the bottom after delayed layout growth when pinned", async () => {
+    vi.useFakeTimers();
+    const taskpane = await loadTaskpaneModule({
+      sync: vi.fn(async () => {})
+    });
+    const messagesElement = document.getElementById("messages") as {
+      scrollTop: number;
+      scrollHeight: number;
+      clientHeight: number;
+      lastElementChild?: { scrollIntoView?: ReturnType<typeof vi.fn> };
+    };
+    const scrollIntoView = vi.fn();
+
+    messagesElement.scrollTop = 120;
+    messagesElement.scrollHeight = 480;
+    messagesElement.clientHeight = 320;
+    messagesElement.lastElementChild = { scrollIntoView };
+
+    taskpane.scheduleMessagesAutoScroll(true);
+    expect(messagesElement.scrollTop).toBe(480);
+
+    messagesElement.scrollHeight = 960;
+    vi.runAllTimers();
+
+    expect(messagesElement.scrollTop).toBe(960);
+    expect(scrollIntoView).toHaveBeenCalled();
+    vi.useRealTimers();
+  });
+
+  it("does not yank the viewport back down after the user scrolls away", async () => {
+    vi.useFakeTimers();
+    const taskpane = await loadTaskpaneModule({
+      sync: vi.fn(async () => {})
+    });
+    const messagesElement = document.getElementById("messages") as {
+      scrollTop: number;
+      scrollHeight: number;
+      clientHeight: number;
+      lastElementChild?: { scrollIntoView?: ReturnType<typeof vi.fn> };
+      dispatch: (type: string, event?: unknown) => void;
+    };
+    const scrollIntoView = vi.fn();
+
+    messagesElement.scrollHeight = 900;
+    messagesElement.clientHeight = 300;
+    messagesElement.lastElementChild = { scrollIntoView };
+    taskpane.bindMessageAutoScrollObservers();
+
+    messagesElement.scrollTop = 80;
+    messagesElement.dispatch("scroll");
+
+    taskpane.scheduleMessagesAutoScroll();
+    expect(messagesElement.scrollTop).toBe(80);
+
+    vi.runAllTimers();
+    expect(messagesElement.scrollTop).toBe(80);
+    expect(scrollIntoView).not.toHaveBeenCalled();
+    vi.useRealTimers();
+  });
+
+  it("does not auto-enable document auto-open by default for ordinary workbooks", async () => {
+    const documentSettings = new Map<string, unknown>();
+    const setStartupBehavior = vi.fn(async () => undefined);
+    const taskpane = await loadTaskpaneModule({
+      sync: vi.fn(async () => {})
+    }, {
+      documentSettings,
+      addinSetStartupBehavior: setStartupBehavior
+    });
+
+    await taskpane.ensureDemoStartupDefaults();
+
+    expect(setStartupBehavior).not.toHaveBeenCalled();
+    expect(documentSettings.get("Office.AutoShowTaskpaneWithDocument")).toBeUndefined();
+    expect(documentSettings.get("Hermes.EnableAutoOpen")).toBeUndefined();
+  });
+
+  it("persists document auto-open only when explicitly opted in for demo usage", async () => {
+    const documentSettings = new Map<string, unknown>();
+    const setStartupBehavior = vi.fn(async () => undefined);
+    const taskpane = await loadTaskpaneModule({
+      sync: vi.fn(async () => {})
+    }, {
+      documentSettings,
+      locationSearch: "?enableDocumentAutoOpen=1",
+      addinSetStartupBehavior: setStartupBehavior
+    });
+
+    await taskpane.ensureDemoStartupDefaults();
+
+    expect(setStartupBehavior).toHaveBeenCalledWith("load");
+    expect(documentSettings.get("Office.AutoShowTaskpaneWithDocument")).toBe(true);
+    expect(documentSettings.get("Hermes.EnableAutoOpen")).toBe(true);
+  });
+
+  it("does not load the full selected range matrix when the selected range exceeds the inline threshold", async () => {
+    const selectionHeaderValues = [[
+      "Date", "Category", "Product", "Region", "Units",
+      "Revenue", "Rep", "Channel", "Segment", "Discount",
+      "COGS", "Margin", "City", "State", "Country",
+      "Quarter", "Month", "Year", "Customer", "Order ID"
+    ]];
+    const selectionRange = {
+      address: "Sheet1!A1:T500",
+      values: [[123]],
+      formulas: [[""]],
+      load: vi.fn()
+    };
+    const selectionHeaderRange = {
+      values: selectionHeaderValues,
+      load: vi.fn()
+    };
+    const currentRegion = {
+      address: "Sheet1!A1:F10",
+      values: [[
+        "Date", "Category", "Product", "Region", "Units", "Revenue"
+      ]],
+      formulas: [["", "", "", "", "", ""]],
+      load: vi.fn()
+    };
+    const activeCell = {
+      address: "Sheet1!J6",
+      values: [[123]],
+      formulas: [[""]],
+      load: vi.fn(),
+      getSurroundingRegion: vi.fn(() => currentRegion)
+    };
+    const sheet = {
+      name: "Sheet1",
+      load: vi.fn(),
+      getRange: vi.fn((a1: string) => a1 === "A1:T1" ? selectionHeaderRange : selectionHeaderRange)
+    };
+
+    const taskpane = await loadTaskpaneModule({
+      sync: vi.fn(async () => {}),
+      workbook: {
+        getSelectedRange() {
+          return selectionRange;
+        },
+        getActiveCell() {
+          return activeCell;
+        },
+        worksheets: {
+          getActiveWorksheet() {
+            return sheet;
+          }
+        }
+      }
+    });
+
+    const snapshot = await taskpane.getSpreadsheetSnapshot("Explain the current selection");
+
+    expect(selectionRange.load).toHaveBeenCalledWith(["address"]);
+    expect(selectionRange.load).not.toHaveBeenCalledWith(["values", "formulas"]);
+    expect(sheet.getRange).toHaveBeenCalledWith("A1:T1");
+    expect(selectionHeaderRange.load).toHaveBeenCalledWith(["values"]);
+    expect(snapshot.context.selection).toMatchObject({
+      range: "A1:T500",
+      headers: selectionHeaderValues[0]
+    });
+    expect(snapshot.context.selection.values).toBeUndefined();
+    expect(snapshot.context.selection.formulas).toBeUndefined();
+  });
+
+  it("does not load the full currentRegion matrix when the current table exceeds the inline threshold", async () => {
+    const headerValues = [[
+      "Date", "Category", "Product", "Region", "Units",
+      "Revenue", "Rep", "Channel", "Segment", "Discount",
+      "COGS", "Margin", "City", "State", "Country",
+      "Quarter", "Month", "Year", "Customer", "Order ID"
+    ]];
+    const selectionRange = {
+      address: "Sheet1!J6",
+      values: [[123]],
+      formulas: [[""]],
+      load: vi.fn()
+    };
+    const currentRegion = {
+      address: "Sheet1!A1:T500",
+      values: [[123]],
+      formulas: [[""]],
+      load: vi.fn()
+    };
+    const headerRange = {
+      values: headerValues,
+      load: vi.fn()
+    };
+    const activeCell = {
+      address: "Sheet1!J6",
+      values: [[123]],
+      formulas: [[""]],
+      load: vi.fn(),
+      getSurroundingRegion: vi.fn(() => currentRegion)
+    };
+    const sheet = {
+      name: "Sheet1",
+      load: vi.fn(),
+      getRange: vi.fn(() => headerRange)
+    };
+
+    const taskpane = await loadTaskpaneModule({
+      sync: vi.fn(async () => {}),
+      workbook: {
+        getSelectedRange() {
+          return selectionRange;
+        },
+        getActiveCell() {
+          return activeCell;
+        },
+        worksheets: {
+          getActiveWorksheet() {
+            return sheet;
+          }
+        }
+      }
+    });
+
+    const snapshot = await taskpane.getSpreadsheetSnapshot("Explain the current selection");
+
+    expect(currentRegion.load).toHaveBeenCalledWith(["address"]);
+    expect(currentRegion.load).not.toHaveBeenCalledWith(["values", "formulas"]);
+    expect(sheet.getRange).toHaveBeenCalledWith("A1:T1");
+    expect(headerRange.load).toHaveBeenCalledWith(["values"]);
+    expect(snapshot.context.currentRegion).toMatchObject({
+      range: "A1:T500",
+      headers: headerValues[0]
+    });
+    expect(snapshot.context.currentRegion.values).toBeUndefined();
+    expect(snapshot.context.currentRegion.formulas).toBeUndefined();
+    expect(snapshot.context.currentRegionArtifactTarget).toBe("A502");
+    expect(snapshot.context.currentRegionAppendTarget).toBe("A501:T501");
+  });
+
+  it("falls back to worksheet A1 when Excel cannot resolve the current selection resource", async () => {
+    let syncCount = 0;
+    const fallbackRange = {
+      address: "Sheet1!A1",
+      values: [["EEID"]],
+      formulas: [[""]],
+      load: vi.fn()
+    };
+    const selectionRange = {
+      address: "Sheet1!C7",
+      values: [["stale"]],
+      formulas: [[""]],
+      load: vi.fn()
+    };
+    const activeCell = {
+      address: "Sheet1!C7",
+      values: [["stale"]],
+      formulas: [[""]],
+      load: vi.fn(),
+      getSurroundingRegion: vi.fn(() => selectionRange)
+    };
+    const sheet = {
+      name: "Sheet1",
+      load: vi.fn(),
+      getRange: vi.fn((a1: string) => {
+        if (a1 === "A1") {
+          return fallbackRange;
+        }
+        return fallbackRange;
+      })
+    };
+
+    const taskpane = await loadTaskpaneModule({
+      sync: vi.fn(async () => {
+        syncCount += 1;
+        if (syncCount === 2) {
+          throw new Error("The requested resource doesn't exist.");
+        }
+      }),
+      workbook: {
+        getSelectedRange() {
+          return selectionRange;
+        },
+        getActiveCell() {
+          return activeCell;
+        },
+        worksheets: {
+          getActiveWorksheet() {
+            return sheet;
+          }
+        }
+      }
+    });
+
+    const snapshot = await taskpane.getSpreadsheetSnapshot("Explain the current selection");
+
+    expect(sheet.getRange).toHaveBeenCalledWith("A1");
+    expect(snapshot.host.activeSheet).toBe("Sheet1");
+    expect(snapshot.context.selection.range).toBe("A1");
+    expect(snapshot.context.activeCell?.a1Notation).toBe("A1");
+  });
+
+  it("preserves the selected range when only the active-cell resource is unavailable", async () => {
+    let syncCount = 0;
+    const selectionRange = {
+      address: "Sheet1!C7:D8",
+      values: [["foo", "bar"], ["baz", "qux"]],
+      formulas: [["", ""], ["", ""]],
+      load: vi.fn()
+    };
+    const fallbackActiveCell = {
+      address: "Sheet1!C7",
+      values: [["foo"]],
+      formulas: [[""]],
+      load: vi.fn(),
+      getSurroundingRegion: vi.fn(() => selectionRange)
+    };
+    const activeCell = {
+      address: "Sheet1!C8",
+      values: [["qux"]],
+      formulas: [[""]],
+      load: vi.fn(),
+      getSurroundingRegion: vi.fn(() => selectionRange)
+    };
+    const headerRange = {
+      values: [["foo", "bar"]],
+      load: vi.fn()
+    };
+    const sheet = {
+      name: "Sheet1",
+      load: vi.fn(),
+      getRange: vi.fn((a1: string) => {
+        if (a1 === "C7") {
+          return fallbackActiveCell;
+        }
+        return headerRange;
+      })
+    };
+
+    const taskpane = await loadTaskpaneModule({
+      sync: vi.fn(async () => {
+        syncCount += 1;
+        if (syncCount === 3) {
+          throw new Error("The requested resource doesn't exist.");
+        }
+      }),
+      workbook: {
+        getSelectedRange() {
+          return selectionRange;
+        },
+        getActiveCell() {
+          return activeCell;
+        },
+        worksheets: {
+          getActiveWorksheet() {
+            return sheet;
+          }
+        }
+      }
+    });
+
+    const snapshot = await taskpane.getSpreadsheetSnapshot("Explain the current selection");
+
+    expect(sheet.getRange).toHaveBeenCalledWith("C7");
+    expect(snapshot.context.selection.range).toBe("C7:D8");
+    expect(snapshot.context.activeCell?.a1Notation).toBe("C7");
+  });
+
+  it("treats unsupported Excel preview plans as non-confirmable write plans", async () => {
+    const taskpane = await loadTaskpaneModule({
+      sync: vi.fn(async () => {})
+    });
+
+    const unsupportedValidation = {
+      type: "data_validation_plan",
+      data: {
+        targetSheet: "Sheet1",
+        targetRange: "B2:B20",
+        ruleType: "time",
+        allowBlank: false,
+        invalidDataBehavior: "reject",
+        explanation: "Validate times only.",
+        confidence: 0.5,
+        requiresConfirmation: true
+      }
+    };
+    const unsupportedConditional = {
+      type: "conditional_format_plan",
+      data: {
+        targetSheet: "Sheet1",
+        targetRange: "B2:B20",
+        managementMode: "add",
+        ruleType: "text_contains",
+        text: "overdue",
+        style: {
+          underline: true
+        },
+        explanation: "Highlight overdue rows.",
+        confidence: 0.5,
+        requiresConfirmation: true
+      }
+    };
+    const unsupportedCleanup = {
+      type: "data_cleanup_plan",
+      data: {
+        targetSheet: "Contacts",
+        targetRange: "A2:A20",
+        operation: "standardize_format",
+        formatType: "date_text",
+        formatPattern: "locale-sensitive-fuzzy",
+        explanation: "Normalize date strings with a fuzzy locale format.",
+        confidence: 0.5,
+        requiresConfirmation: true
+      }
+    };
+
+    expect(taskpane.isWritePlanResponse(unsupportedValidation)).toBe(false);
+    expect(taskpane.renderStructuredPreview(unsupportedValidation, {
+      runId: "run_validation_unsupported_excel_001",
+      requestId: "req_validation_unsupported_excel_001"
+    })).toContain("This Excel runtime can't apply that validation rule.");
+
+    expect(taskpane.isWritePlanResponse(unsupportedConditional)).toBe(false);
+    expect(taskpane.renderStructuredPreview(unsupportedConditional, {
+      runId: "run_conditional_unsupported_excel_001",
+      requestId: "req_conditional_unsupported_excel_001"
+    })).toContain("This Excel runtime can't apply that conditional formatting style exactly.");
+
+    expect(taskpane.isWritePlanResponse(unsupportedCleanup)).toBe(false);
+    const cleanupHtml = taskpane.renderStructuredPreview(unsupportedCleanup, {
+      runId: "run_cleanup_unsupported_excel_001",
+      requestId: "req_cleanup_unsupported_excel_001"
+    });
+    expect(cleanupHtml).toContain("This Excel runtime only supports exact year-first date text patterns");
+    expect(cleanupHtml).not.toContain("Confirm Cleanup");
+  });
+
+  it("renders advisory formula-debug previews with intent metadata without treating them as write plans", async () => {
+    const taskpane = await loadTaskpaneModule({
+      sync: vi.fn(async () => {})
+    });
+
+    const response = {
+      type: "formula",
+      data: {
+        intent: "fix",
+        targetCell: "H11",
+        formula: "=SUMIF(B:B,\"north\",F:F)",
+        formulaLanguage: "excel",
+        explanation: "Use the Region column as the criteria range and Revenue as the sum range.",
+        confidence: 0.94
+      }
+    };
+
+    expect(taskpane.isWritePlanResponse(response)).toBe(false);
+    expect(taskpane.getStructuredPreview(response)).toMatchObject({
+      kind: "formula",
+      intent: "fix",
+      targetCell: "H11"
+    });
+
+    const html = taskpane.renderStructuredPreview(response, {
+      runId: "run_formula_debug_001",
+      requestId: "req_formula_debug_001"
+    });
+
+    expect(html).toContain("Formula");
+    expect(html).toContain("fix");
+    expect(html).toContain("H11");
+    expect(html).toContain('=SUMIF(B:B,"north",F:F)');
+  });
+
+  it("renders external data imports as preview-only plans on Excel hosts", async () => {
+    const taskpane = await loadTaskpaneModule({
+      sync: vi.fn(async () => {})
+    });
+
+    const response = {
+      type: "external_data_plan",
+      data: {
+        sourceType: "web_table_import",
+        provider: "importhtml",
+        sourceUrl: "https://example.com/prices",
+        selectorType: "table",
+        selector: 1,
+        targetSheet: "Imported Data",
+        targetRange: "A1",
+        formula: '=IMPORTHTML("https://example.com/prices","table",1)',
+        explanation: "Anchor the first public table in A1.",
+        confidence: 0.87,
+        requiresConfirmation: true,
+        affectedRanges: ["Imported Data!A1"],
+        overwriteRisk: "low",
+        confirmationLevel: "standard"
+      }
+    };
+
+    expect(taskpane.isWritePlanResponse(response)).toBe(false);
+    expect(taskpane.getStructuredPreview(response)).toMatchObject({
+      kind: "external_data_plan",
+      provider: "importhtml",
+      targetSheet: "Imported Data",
+      targetRange: "A1"
+    });
+
+    const html = taskpane.renderStructuredPreview(response, {
+      runId: "run_external_data_excel_001",
+      requestId: "req_external_data_excel_001"
+    });
+
+    expect(html).toContain("IMPORTHTML");
+    expect(html).toContain("can't create first-class external data imports yet");
+    expect(html).not.toContain("Confirm External Data");
+  });
+
+  it("renders a composite preview with dry-run and destructive flags", async () => {
+    const taskpane = await loadTaskpaneModule({
+      sync: vi.fn(async () => {})
+    });
+
+    const response = {
+      type: "composite_plan",
+      data: {
+        steps: [
+          {
+            stepId: "step_sort",
+            dependsOn: [],
+            continueOnError: false,
+            plan: {
+              targetSheet: "Sales",
+              targetRange: "A1:F50",
+              hasHeader: true,
+              keys: [{ columnRef: "Revenue", direction: "desc" }],
+              explanation: "Sort by revenue.",
+              confidence: 0.91,
+              requiresConfirmation: true,
+              affectedRanges: ["Sales!A1:F50"],
+              overwriteRisk: "low",
+              confirmationLevel: "standard"
+            }
+          },
+          {
+            stepId: "step_cleanup",
+            dependsOn: ["step_sort"],
+            continueOnError: true,
+            plan: {
+              targetSheet: "Sales",
+              targetRange: "A1:F50",
+              operation: "remove_duplicate_rows",
+              explanation: "Remove duplicate rows after sorting.",
+              confidence: 0.85,
+              requiresConfirmation: true,
+              affectedRanges: ["Sales!A1:F50"],
+              overwriteRisk: "medium",
+              confirmationLevel: "destructive"
+            }
+          }
+        ],
+        explanation: "Sort the sales table and then remove duplicate rows.",
+        confidence: 0.89,
+        requiresConfirmation: true,
+        affectedRanges: ["Sales!A1:F50"],
+        overwriteRisk: "medium",
+        confirmationLevel: "destructive",
+        reversible: false,
+        dryRunRecommended: true,
+        dryRunRequired: true
+      }
+    };
+
+    expect(taskpane.isWritePlanResponse(response)).toBe(true);
+    expect(taskpane.getRequiresConfirmation(response)).toBe(true);
+    expect(taskpane.getStructuredPreview(response)).toMatchObject({
+      kind: "composite_plan",
+      stepCount: 2,
+      dryRunRequired: true,
+      reversible: false,
+      confirmationLevel: "destructive"
+    });
+
+    const html = taskpane.renderStructuredPreview(response, {
+      runId: "run_composite_preview_001",
+      requestId: "req_composite_preview_001"
+    });
+
+    expect(html).toContain("Confirm Workflow");
+    expect(html).toContain("Will run 2 workflow steps.");
+    expect(html).toContain("dry run required");
+    expect(html).toContain("step_sort");
+    expect(html).toContain("step_cleanup");
+    expect(html).toContain("Remove duplicate rows after sorting.");
+  });
+
+  it("flags unsupported composite steps before the user confirms the workflow", async () => {
+    const taskpane = await loadTaskpaneModule({
+      sync: vi.fn(async () => {})
+    });
+
+    const response = {
+      type: "composite_plan",
+      data: {
+        steps: [
+          {
+            stepId: "step_validation",
+            dependsOn: [],
+            continueOnError: false,
+            plan: {
+              targetSheet: "Sheet1",
+              targetRange: "B2:B20",
+              ruleType: "list",
+              allowBlank: false,
+              invalidDataBehavior: "reject",
+              explanation: "Apply a supported validation rule.",
+              confidence: 0.9,
+              requiresConfirmation: true
+            }
+          },
+          {
+            stepId: "step_cleanup",
+            dependsOn: ["step_validation"],
+            continueOnError: false,
+            plan: {
+              targetSheet: "Contacts",
+              targetRange: "A2:A20",
+              operation: "standardize_format",
+              formatType: "date_text",
+              formatPattern: "locale-sensitive-fuzzy",
+              explanation: "Normalize date strings with a fuzzy locale format.",
+              confidence: 0.5,
+              requiresConfirmation: true
+            }
+          }
+        ],
+        explanation: "Apply validation, then normalize the imported dates.",
+        confidence: 0.7,
+        requiresConfirmation: true,
+        affectedRanges: ["Sheet1!B2:B20", "Contacts!A2:A20"],
+        overwriteRisk: "medium",
+        confirmationLevel: "standard",
+        reversible: false,
+        dryRunRecommended: true,
+        dryRunRequired: false
+      }
+    };
+
+    expect(taskpane.isWritePlanResponse(response)).toBe(false);
+    const html = taskpane.renderStructuredPreview(response, {
+      runId: "run_composite_unsupported_excel_001",
+      requestId: "req_composite_unsupported_excel_001"
+    });
+    expect(html).toContain("Some workflow steps can't run in this Excel runtime yet.");
+    expect(html).toContain("This Excel runtime only supports exact year-first date text patterns");
+    expect(html).not.toContain("Confirm Workflow");
+  });
+
+  it("flags unsupported filter child steps inside composite previews", async () => {
+    const taskpane = await loadTaskpaneModule({
+      sync: vi.fn(async () => {})
+    });
+
+    const response = {
+      type: "composite_plan",
+      data: {
+        steps: [
+          {
+            stepId: "step_filter",
+            dependsOn: [],
+            continueOnError: false,
+            plan: {
+              targetSheet: "Sales",
+              targetRange: "A1:F50",
+              hasHeader: true,
+              conditions: [
+                { columnRef: "Status", operator: "equals", value: "Open" },
+                { columnRef: "Amount", operator: "greaterThan", value: 1000 }
+              ],
+              combiner: "or",
+              clearExistingFilters: true,
+              explanation: "Keep open rows or large deals.",
+              confidence: 0.86,
+              requiresConfirmation: true
+            }
+          },
+          {
+            stepId: "step_validation",
+            dependsOn: ["step_filter"],
+            continueOnError: false,
+            plan: {
+              targetSheet: "Sales",
+              targetRange: "G2:G50",
+              ruleType: "whole_number",
+              comparator: "greater_than",
+              value: 0,
+              allowBlank: false,
+              invalidDataBehavior: "reject",
+              explanation: "Keep forecast amounts positive.",
+              confidence: 0.9,
+              requiresConfirmation: true
+            }
+          }
+        ],
+        explanation: "Filter the sales table, then validate forecast values.",
+        confidence: 0.78,
+        requiresConfirmation: true,
+        affectedRanges: ["Sales!A1:F50", "Sales!G2:G50"],
+        overwriteRisk: "medium",
+        confirmationLevel: "standard",
+        reversible: false,
+        dryRunRecommended: true,
+        dryRunRequired: false
+      }
+    };
+
+    expect(taskpane.isWritePlanResponse(response)).toBe(false);
+    const html = taskpane.renderStructuredPreview(response, {
+      runId: "run_composite_filter_unsupported_excel_001",
+      requestId: "req_composite_filter_unsupported_excel_001"
+    });
+    expect(html).toContain("Some workflow steps can't run in this Excel runtime yet.");
+    expect(html).toContain("can't combine those filter conditions exactly");
+    expect(html).not.toContain("Confirm Workflow");
+  });
+
+  it("marks destructive structural child steps as non-reversible in composite previews", async () => {
+    const taskpane = await loadTaskpaneModule({
+      sync: vi.fn(async () => {})
+    });
+
+    const preview = taskpane.getStructuredPreview({
+      type: "composite_plan",
+      data: {
+        steps: [
+          {
+            stepId: "step_delete_rows",
+            dependsOn: [],
+            continueOnError: false,
+            plan: {
+              targetSheet: "Sales",
+              operation: "delete_rows",
+              startIndex: 4,
+              count: 2,
+              explanation: "Delete two stale rows.",
+              confidence: 0.82,
+              requiresConfirmation: true,
+              affectedRanges: ["Sales!A5:F6"],
+              overwriteRisk: "high",
+              confirmationLevel: "destructive"
+            }
+          }
+        ],
+        explanation: "Delete stale rows.",
+        confidence: 0.82,
+        requiresConfirmation: true,
+        affectedRanges: ["Sales!A5:F6"],
+        overwriteRisk: "high",
+        confirmationLevel: "standard",
+        reversible: false,
+        dryRunRecommended: true,
+        dryRunRequired: false
+      }
+    });
+
+    expect(preview).toMatchObject({
+      kind: "composite_plan",
+      steps: [
+        {
+          stepId: "step_delete_rows",
+          destructive: true,
+          reversible: false
+        }
+      ]
+    });
+  });
+
+  it("requires destructive confirmation when a composite child step is destructive even if the top-level plan is standard", async () => {
+    const confirmMock = vi.fn(() => true);
+    vi.stubGlobal("confirm", confirmMock);
+
+    const taskpane = await loadTaskpaneModule({
+      sync: vi.fn(async () => {})
+    });
+
+    expect(taskpane.buildWriteApprovalRequest({
+      requestId: "req_composite_destructive_001",
+      runId: "run_composite_destructive_001",
+      workbookSessionKey: "excel_windows::workbook-123",
+      plan: {
+        steps: [
+          {
+            stepId: "step_delete_rows",
+            dependsOn: [],
+            continueOnError: false,
+            plan: {
+              targetSheet: "Sales",
+              operation: "delete_rows",
+              startIndex: 4,
+              count: 2,
+              explanation: "Delete two stale rows.",
+              confidence: 0.82,
+              requiresConfirmation: true,
+              affectedRanges: ["Sales!A5:F6"],
+              overwriteRisk: "high",
+              confirmationLevel: "destructive"
+            }
+          }
+        ],
+        explanation: "Delete stale rows.",
+        confidence: 0.82,
+        requiresConfirmation: true,
+        affectedRanges: ["Sales!A5:F6"],
+        overwriteRisk: "high",
+        confirmationLevel: "standard",
+        reversible: false,
+        dryRunRecommended: true,
+        dryRunRequired: false
+      }
+    })).toMatchObject({
+      requestId: "req_composite_destructive_001",
+      runId: "run_composite_destructive_001",
+      workbookSessionKey: "excel_windows::workbook-123",
+      destructiveConfirmation: {
+        confirmed: true
+      }
+    });
+
+    expect(confirmMock).toHaveBeenCalledTimes(1);
+  });
+
+  it("maps dry-run, history, undo, and redo through the gateway client using workbook/session scope", async () => {
+    const workbookSessionId = "workbook-123";
+    const workbookSessionKey = `excel_windows::${workbookSessionId}`;
+    const snapshotStoreKey = `Hermes.ReversibleExecutions.v1::${workbookSessionKey}`;
+    const localSnapshotStore = JSON.stringify({
+      version: 1,
+      order: ["exec_001"],
+      executions: {
+        exec_001: {
+          baseExecutionId: "exec_001"
+        }
+      },
+      bases: {
+        exec_001: {
+          baseExecutionId: "exec_001",
+          targetSheet: "Sales",
+          targetRange: "A1",
+          beforeCells: [[{ kind: "value", value: { type: "string", value: "before" } }]],
+          afterCells: [[{ kind: "value", value: { type: "string", value: "after" } }]]
+        }
+      }
+    });
+    const fetchMock = vi.fn(async (url: string, init?: { body?: string }) => ({
+      ok: true,
+      async json() {
+        if (url.endsWith("/api/execution/dry-run")) {
+          return {
+            planDigest: "digest_001",
+            workbookSessionKey: "excel_windows::budget-xlsx",
+            simulated: true,
+            predictedAffectedRanges: ["Sales!A1:F50"],
+            predictedSummaries: ["Would sort and filter Sales!A1:F50."],
+            overwriteRisk: "low",
+            reversible: true,
+            expiresAt: "2099-01-01T00:00:00.000Z"
+          };
+        }
+
+        if (url.includes("/api/execution/history")) {
+          return {
+            entries: [
+              {
+                executionId: "exec_001",
+                requestId: "req_001",
+                runId: "run_001",
+                planType: "composite_plan",
+                planDigest: "digest_001",
+                status: "completed",
+                timestamp: "2099-01-01T00:00:00.000Z",
+                reversible: true,
+                undoEligible: true,
+                redoEligible: false,
+                summary: "Completed workflow."
+              }
+            ]
+          };
+        }
+
+        if (url.endsWith("/api/execution/undo")) {
+          return {
+            kind: "composite_update",
+            operation: "composite_update",
+            hostPlatform: "excel_windows",
+            executionId: "exec_undo_001",
+            stepResults: [],
+            summary: init?.body || ""
+          };
+        }
+
+        if (url.endsWith("/api/execution/redo")) {
+          return {
+            kind: "composite_update",
+            operation: "composite_update",
+            hostPlatform: "excel_windows",
+            executionId: "exec_redo_001",
+            stepResults: [],
+            summary: init?.body || ""
+          };
+        }
+
+        return {
+          kind: "composite_update",
+          operation: "composite_update",
+          hostPlatform: "excel_windows",
+          executionId: "exec_001",
+          stepResults: [],
+          summary: init?.body || ""
+        };
+      }
+    }));
+
+    const appliedCells: Array<{ kind: string; value: unknown }> = [];
+    const targetRange = {
+      rowCount: 1,
+      columnCount: 1,
+      load() {},
+      getCell() {
+        return {
+          set formulas(value: unknown) {
+            appliedCells.push({ kind: "formula", value });
+          },
+          set values(value: unknown) {
+            appliedCells.push({ kind: "value", value });
+          }
+        };
+      }
+    };
+
+    const taskpane = await loadTaskpaneModule(
+      {
+        sync: vi.fn(async () => {}),
+        workbook: {
+          worksheets: {
+            getItem() {
+              return {
+                getRange() {
+                  return targetRange;
+                }
+              };
+            }
+          }
+        }
+      },
+      {
+        fetchImpl: fetchMock,
+        documentSettings: new Map([["Hermes.WorkbookSessionId", workbookSessionId]]),
+        localStorageSeed: {
+          [snapshotStoreKey]: localSnapshotStore
+        }
+      }
+    );
+
+    await taskpane.dryRunCompositePlan({
+      requestId: "req_composite_dry_run_001",
+      runId: "run_composite_dry_run_001",
+      plan: {
+        steps: [
+          {
+            stepId: "step_sort",
+            dependsOn: [],
+            continueOnError: false,
+            plan: {
+              targetSheet: "Sales",
+              targetRange: "A1:F50",
+              hasHeader: true,
+              keys: [{ columnRef: "Revenue", direction: "desc" }],
+              explanation: "Sort by revenue.",
+              confidence: 0.91,
+              requiresConfirmation: true,
+              affectedRanges: ["Sales!A1:F50"],
+              overwriteRisk: "low",
+              confirmationLevel: "standard"
+            }
+          }
+        ],
+        explanation: "Sort the sales table.",
+        confidence: 0.91,
+        requiresConfirmation: true,
+        affectedRanges: ["Sales!A1:F50"],
+        overwriteRisk: "low",
+        confirmationLevel: "standard",
+        reversible: true,
+        dryRunRecommended: true,
+        dryRunRequired: false
+      }
+    });
+
+    await taskpane.listExecutionHistory({ limit: 5 });
+    await taskpane.undoExecution("exec_001");
+    await taskpane.redoExecution("exec_undo_001");
+
+    expect(fetchMock).toHaveBeenCalledTimes(4);
+    expect(fetchMock.mock.calls[0][0]).toBe("http://127.0.0.1:8787/api/execution/dry-run");
+    expect(JSON.parse(String(fetchMock.mock.calls[0][1]?.body))).toMatchObject({
+      workbookSessionKey
+    });
+    expect(fetchMock.mock.calls[1][0]).toBe(
+      `http://127.0.0.1:8787/api/execution/history?workbookSessionKey=${encodeURIComponent(workbookSessionKey)}&limit=5`
+    );
+    expect(fetchMock.mock.calls[2][0]).toBe("http://127.0.0.1:8787/api/execution/undo");
+    expect(JSON.parse(String(fetchMock.mock.calls[2][1]?.body))).toMatchObject({
+      executionId: "exec_001",
+      workbookSessionKey
+    });
+    expect(fetchMock.mock.calls[3][0]).toBe("http://127.0.0.1:8787/api/execution/redo");
+    expect(JSON.parse(String(fetchMock.mock.calls[3][1]?.body))).toMatchObject({
+      executionId: "exec_undo_001",
+      workbookSessionKey
+    });
+    expect(appliedCells).toEqual([
+      { kind: "value", value: [["before"]] },
+      { kind: "value", value: [["after"]] }
+    ]);
+  });
+
+  it("fails undo and redo before calling the gateway when the local snapshot shape is stale", async () => {
+    const workbookSessionId = "workbook-123";
+    const workbookSessionKey = `excel_windows::${workbookSessionId}`;
+    const snapshotStoreKey = `Hermes.ReversibleExecutions.v1::${workbookSessionKey}`;
+    const localSnapshotStore = JSON.stringify({
+      version: 1,
+      order: ["exec_001", "exec_undo_001"],
+      executions: {
+        exec_001: {
+          baseExecutionId: "exec_001"
+        },
+        exec_undo_001: {
+          baseExecutionId: "exec_001"
+        }
+      },
+      bases: {
+        exec_001: {
+          baseExecutionId: "exec_001",
+          targetSheet: "Sales",
+          targetRange: "A1",
+          beforeCells: [[{ kind: "value", value: { type: "string", value: "before" } }]],
+          afterCells: [[{ kind: "value", value: { type: "string", value: "after" } }]]
+        }
+      }
+    });
+    const fetchMock = vi.fn();
+    const targetRange = {
+      rowCount: 2,
+      columnCount: 1,
+      load() {},
+      getCell() {
+        return {
+          set formulas(_value: unknown) {},
+          set values(_value: unknown) {}
+        };
+      }
+    };
+
+    const taskpane = await loadTaskpaneModule(
+      {
+        sync: vi.fn(async () => {}),
+        workbook: {
+          worksheets: {
+            getItem() {
+              return {
+                getRange() {
+                  return targetRange;
+                }
+              };
+            }
+          }
+        }
+      },
+      {
+        fetchImpl: fetchMock,
+        documentSettings: new Map([["Hermes.WorkbookSessionId", workbookSessionId]]),
+        localStorageSeed: {
+          [snapshotStoreKey]: localSnapshotStore
+        }
+      }
+    );
+
+    await expect(taskpane.undoExecution("exec_001")).rejects.toThrow(
+      "The saved undo snapshot no longer matches the current range shape."
+    );
+    await expect(taskpane.redoExecution("exec_undo_001")).rejects.toThrow(
+      "The saved undo snapshot no longer matches the current range shape."
+    );
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  it("fails undo and redo before calling the gateway when the local snapshot store cannot persist redo lineage", async () => {
+    const workbookSessionId = "workbook-123";
+    const workbookSessionKey = `excel_windows::${workbookSessionId}`;
+    const snapshotStoreKey = `Hermes.ReversibleExecutions.v1::${workbookSessionKey}`;
+    const localSnapshotStore = JSON.stringify({
+      version: 1,
+      order: ["exec_001", "exec_undo_001"],
+      executions: {
+        exec_001: {
+          baseExecutionId: "exec_001"
+        },
+        exec_undo_001: {
+          baseExecutionId: "exec_001"
+        }
+      },
+      bases: {
+        exec_001: {
+          baseExecutionId: "exec_001",
+          targetSheet: "Sales",
+          targetRange: "A1",
+          beforeCells: [[{ kind: "value", value: { type: "string", value: "before" } }]],
+          afterCells: [[{ kind: "value", value: { type: "string", value: "after" } }]]
+        }
+      }
+    });
+    const fetchMock = vi.fn();
+    const targetRange = {
+      rowCount: 1,
+      columnCount: 1,
+      load() {},
+      getCell() {
+        return {
+          set formulas(_value: unknown) {},
+          set values(_value: unknown) {}
+        };
+      }
+    };
+
+    const taskpane = await loadTaskpaneModule(
+      {
+        sync: vi.fn(async () => {}),
+        workbook: {
+          worksheets: {
+            getItem() {
+              return {
+                getRange() {
+                  return targetRange;
+                }
+              };
+            }
+          }
+        }
+      },
+      {
+        fetchImpl: fetchMock,
+        documentSettings: new Map([["Hermes.WorkbookSessionId", workbookSessionId]]),
+        localStorageSeed: {
+          [snapshotStoreKey]: localSnapshotStore
+        }
+      }
+    );
+
+    window.localStorage.setItem = vi.fn(() => {
+      throw new Error("quota exceeded");
+    });
+
+    await expect(taskpane.undoExecution("exec_001")).rejects.toThrow(
+      "That history entry is no longer available in this spreadsheet session."
+    );
+    await expect(taskpane.redoExecution("exec_undo_001")).rejects.toThrow(
+      "That history entry is no longer available in this spreadsheet session."
+    );
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  it("uses a workbook identity that does not collide for same-name files at different URLs", async () => {
+    const fetchA = vi.fn(async (url: string) => ({
+      ok: true,
+      async json() {
+        return url;
+      }
+    }));
+    const fetchB = vi.fn(async (url: string) => ({
+      ok: true,
+      async json() {
+        return url;
+      }
+    }));
+
+    const taskpaneA = await loadTaskpaneModule(
+      { sync: vi.fn(async () => {}) },
+      {
+        documentUrl: "https://tenant-a.example/Shared/Budget.xlsx",
+        fetchImpl: fetchA
+      }
+    );
+    await taskpaneA.listExecutionHistory({ limit: 1 });
+
+    const taskpaneB = await loadTaskpaneModule(
+      { sync: vi.fn(async () => {}) },
+      {
+        documentUrl: "https://tenant-b.example/Shared/Budget.xlsx",
+        fetchImpl: fetchB
+      }
+    );
+    await taskpaneB.listExecutionHistory({ limit: 1 });
+
+    expect(fetchA.mock.calls[0][0]).not.toBe(fetchB.mock.calls[0][0]);
+    expect(fetchA.mock.calls[0][0]).not.toContain("excel_windows%3A%3Abudget-xlsx");
+    expect(fetchB.mock.calls[0][0]).not.toContain("excel_windows%3A%3Abudget-xlsx");
+  });
+
+  it("uses distinct workbook identities for unsaved workbooks when document settings are unavailable", async () => {
+    const fetchA = vi.fn(async (url: string) => ({
+      ok: true,
+      async json() {
+        return url;
+      }
+    }));
+    const fetchB = vi.fn(async (url: string) => ({
+      ok: true,
+      async json() {
+        return url;
+      }
+    }));
+
+    const taskpaneA = await loadTaskpaneModule(
+      { sync: vi.fn(async () => {}) },
+      {
+        documentUrl: "",
+        disableDocumentSettings: true,
+        localStorageSeed: { hermesSessionId: "sess_shared_001" },
+        fetchImpl: fetchA
+      }
+    );
+    await taskpaneA.listExecutionHistory({ limit: 1 });
+
+    const taskpaneB = await loadTaskpaneModule(
+      { sync: vi.fn(async () => {}) },
+      {
+        documentUrl: "",
+        disableDocumentSettings: true,
+        localStorageSeed: { hermesSessionId: "sess_shared_001" },
+        fetchImpl: fetchB
+      }
+    );
+    await taskpaneB.listExecutionHistory({ limit: 1 });
+
+    expect(fetchA.mock.calls[0][0]).not.toBe(fetchB.mock.calls[0][0]);
+    expect(fetchA.mock.calls[0][0]).toContain("workbookSessionKey=excel_windows%3A%3Alocal_");
+    expect(fetchB.mock.calls[0][0]).toContain("workbookSessionKey=excel_windows%3A%3Alocal_");
+  });
+
+  it("applies composite update status summaries through the normal message completion path", async () => {
+    const taskpane = await loadTaskpaneModule({
+      sync: vi.fn(async () => {})
+    });
+
+    const message = {
+      content: "Thinking...",
+      response: {
+        type: "composite_plan",
+        data: {
+          steps: [],
+          explanation: "Run workflow.",
+          confidence: 0.75,
+          requiresConfirmation: true,
+          affectedRanges: [],
+          overwriteRisk: "none",
+          confirmationLevel: "standard",
+          reversible: true,
+          dryRunRecommended: false,
+          dryRunRequired: false
+        }
+      },
+      statusLine: "Waiting"
+    };
+
+    taskpane.applyWritebackResultToMessage(message, {
+      kind: "composite_update",
+      operation: "composite_update",
+      hostPlatform: "excel_windows",
+      executionId: "exec_001",
+      stepResults: [
+        { stepId: "step_sort", status: "completed", summary: "Sorted table." },
+        { stepId: "step_filter", status: "skipped", summary: "Skipped after dependency failure." }
+      ],
+      summary: "Completed workflow with 2 steps."
+    });
+
+    expect(message.content).toBe(
+      "Completed workflow with 2 steps. Completed: Sorted table. Skipped: Skipped after dependency failure."
+    );
+    expect(message.response).toBeNull();
+    expect(message.statusLine).toBe("");
+  });
+
+  it("returns a valid composite_update result when a workflow step fails closed and later steps are skipped", async () => {
+    const taskpane = await loadTaskpaneModule({
+      sync: vi.fn(async () => {}),
+      workbook: {
+        worksheets: {}
+      }
+    });
+
+    await expect(taskpane.applyWritePlan({
+      plan: {
+        steps: [
+          {
+            stepId: "step_pivot",
+            dependsOn: [],
+            continueOnError: false,
+            plan: {
+              sourceSheet: "Sales",
+              sourceRange: "A1:F50",
+              targetSheet: "Sales Pivot",
+              targetRange: "A1:B2",
+              rowGroups: ["Region"],
+              valueAggregations: [{ field: "Revenue", aggregation: "sum" }],
+              filters: [{ field: "Region", operator: "not_equal_to", value: "APAC" }],
+              sort: { field: "Revenue", direction: "desc", sortOn: "aggregated_value" },
+              explanation: "Build a pivot first.",
+              confidence: 0.9,
+              requiresConfirmation: true,
+              affectedRanges: ["Sales!A1:F50", "Sales Pivot!A1:B2"],
+              overwriteRisk: "low",
+              confirmationLevel: "standard"
+            }
+          },
+          {
+            stepId: "step_chart",
+            dependsOn: ["step_pivot"],
+            continueOnError: false,
+            plan: {
+              sourceSheet: "Sales",
+              sourceRange: "A1:C20",
+              targetSheet: "Sales Chart",
+              targetRange: "A1",
+              chartType: "line",
+              categoryField: "Month",
+              series: [{ field: "Revenue", label: "Revenue" }],
+              explanation: "Chart the pivot output.",
+              confidence: 0.88,
+              requiresConfirmation: true,
+              affectedRanges: ["Sales!A1:C20", "Sales Chart!A1"],
+              overwriteRisk: "low",
+              confirmationLevel: "standard"
+            }
+          }
+        ],
+        explanation: "Build a pivot and then chart it.",
+        confidence: 0.86,
+        requiresConfirmation: true,
+        affectedRanges: ["Sales Pivot!A1:B2", "Sales Chart!A1"],
+        overwriteRisk: "low",
+        confirmationLevel: "standard",
+        reversible: false,
+        dryRunRecommended: true,
+        dryRunRequired: false
+      },
+      requestId: "req_composite_apply_excel_001",
+      runId: "run_composite_apply_excel_001",
+      approvalToken: "token",
+      executionId: "exec_composite_apply_001"
+    })).resolves.toMatchObject({
+      kind: "composite_update",
+      operation: "composite_update",
+      executionId: "exec_composite_apply_001",
+      stepResults: [
+        {
+          stepId: "step_pivot",
+          status: "failed",
+          summary:
+            "This action needs a valid destination cell or anchor.\n\n" +
+            "Choose a single target cell or a valid destination range, then retry."
+        },
+        {
+          stepId: "step_chart",
+          status: "skipped",
+          summary: "Skipped because an earlier workflow step failed."
+        }
+      ]
+    });
+  });
+
+  it("fails closed when a composite step appears before an unsatisfied dependency in Excel execution order", async () => {
+    const taskpane = await loadTaskpaneModule({
+      sync: vi.fn(async () => {}),
+      workbook: {
+        worksheets: {}
+      }
+    });
+
+    await expect(taskpane.applyWritePlan({
+      plan: {
+        steps: [
+          {
+            stepId: "step_chart",
+            dependsOn: ["step_pivot"],
+            continueOnError: false,
+            plan: {
+              sourceSheet: "Sales",
+              sourceRange: "A1:C20",
+              targetSheet: "Sales Chart",
+              targetRange: "A1",
+              chartType: "line",
+              categoryField: "Month",
+              series: [{ field: "Revenue", label: "Revenue" }],
+              explanation: "Chart before the pivot exists.",
+              confidence: 0.88,
+              requiresConfirmation: true,
+              affectedRanges: ["Sales!A1:C20", "Sales Chart!A1"],
+              overwriteRisk: "low",
+              confirmationLevel: "standard"
+            }
+          },
+          {
+            stepId: "step_pivot",
+            dependsOn: [],
+            continueOnError: false,
+            plan: {
+              sourceSheet: "Sales",
+              sourceRange: "A1:F50",
+              targetSheet: "Sales Pivot",
+              targetRange: "A1",
+              rowGroups: ["Region"],
+              valueAggregations: [{ field: "Revenue", aggregation: "sum" }],
+              explanation: "Build the pivot second.",
+              confidence: 0.9,
+              requiresConfirmation: true,
+              affectedRanges: ["Sales!A1:F50", "Sales Pivot!A1"],
+              overwriteRisk: "low",
+              confirmationLevel: "standard"
+            }
+          }
+        ],
+        explanation: "Malformed workflow order.",
+        confidence: 0.7,
+        requiresConfirmation: true,
+        affectedRanges: ["Sales Pivot!A1", "Sales Chart!A1"],
+        overwriteRisk: "low",
+        confirmationLevel: "standard",
+        reversible: false,
+        dryRunRecommended: true,
+        dryRunRequired: false
+      },
+      requestId: "req_composite_order_excel_001",
+      runId: "run_composite_order_excel_001",
+      approvalToken: "token",
+      executionId: "exec_composite_order_excel_001"
+    })).resolves.toMatchObject({
+      kind: "composite_update",
+      operation: "composite_update",
+      executionId: "exec_composite_order_excel_001",
+      stepResults: [
+        {
+          stepId: "step_chart",
+          status: "failed",
+          summary: "Dependency step_pivot has not completed before this step."
+        },
+        {
+          stepId: "step_pivot",
+          status: "skipped",
+          summary: "Skipped because an earlier workflow step failed."
+        }
+      ]
+    });
+  });
+});

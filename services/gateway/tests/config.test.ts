@@ -1,0 +1,105 @@
+import { afterEach, describe, expect, it } from "vitest";
+import { getConfig } from "../src/lib/config.ts";
+
+afterEach(() => {
+  delete process.env.HERMES_DEBUG_INVALID_RESPONSES;
+  delete process.env.APPROVAL_SECRET;
+  delete process.env.GATEWAY_PUBLIC_BASE_URL;
+  delete process.env.GATEWAY_ALLOWED_ORIGINS;
+  delete process.env.HERMES_AGENT_BASE_URL;
+  delete process.env.HERMES_API_SERVER_KEY;
+  delete process.env.HERMES_AGENT_API_KEY;
+  delete process.env.HERMES_AGENT_MODEL;
+  delete process.env.HERMES_AGENT_ID;
+  delete process.env.HERMES_BASE_URL;
+});
+
+describe("gateway config", () => {
+  it("reads Hermes Agent API server settings from the explicit env vars", () => {
+    process.env.HERMES_AGENT_BASE_URL = "http://agent.test";
+    process.env.HERMES_API_SERVER_KEY = "agent-secret";
+    process.env.HERMES_AGENT_MODEL = "hermes-agent";
+
+    expect(getConfig()).toMatchObject({
+      hermesAgentBaseUrl: "http://agent.test",
+      hermesAgentApiKey: "agent-secret",
+      hermesAgentModel: "hermes-agent"
+    });
+  });
+
+  it("keeps HERMES_AGENT_ID as a compatibility fallback for the Hermes model", () => {
+    process.env.HERMES_AGENT_ID = "legacy-agent-id";
+
+    expect(getConfig()).toMatchObject({
+      hermesAgentModel: "legacy-agent-id"
+    });
+  });
+
+  it("keeps HERMES_BASE_URL as a legacy fallback for the Hermes Agent base url", () => {
+    process.env.HERMES_BASE_URL = "http://legacy-agent.test";
+
+    expect(getConfig()).toMatchObject({
+      hermesAgentBaseUrl: "http://legacy-agent.test"
+    });
+  });
+
+  it("defaults the Hermes Agent API base url to the local API server path", () => {
+    expect(getConfig()).toMatchObject({
+      hermesAgentBaseUrl: "http://127.0.0.1:8642/v1"
+    });
+  });
+
+  it("allows the development fallback approval secret on a loopback gateway base url", () => {
+    process.env.GATEWAY_PUBLIC_BASE_URL = "http://127.0.0.1:8787";
+
+    expect(getConfig()).toMatchObject({
+      approvalSecret: "change-me",
+      gatewayPublicBaseUrl: "http://127.0.0.1:8787",
+      allowedCorsOrigins: [
+        "https://docs.google.com",
+        "https://excel.officeapps.live.com",
+        "https://localhost:3000",
+        "https://127.0.0.1:3000"
+      ],
+      saveInvalidHermesDebugArtifacts: false
+    });
+  });
+
+  it("fails closed when the default approval secret would be exposed on a non-local base url", () => {
+    process.env.GATEWAY_PUBLIC_BASE_URL = "https://gateway.example.test/hermes-gateway";
+
+    expect(() => getConfig()).toThrow(
+      "APPROVAL_SECRET must be configured before exposing the gateway on a non-local base URL."
+    );
+  });
+
+  it("enables invalid Hermes debug artifact writes only when explicitly opted in", () => {
+    process.env.HERMES_DEBUG_INVALID_RESPONSES = "true";
+
+    expect(getConfig()).toMatchObject({
+      saveInvalidHermesDebugArtifacts: true
+    });
+  });
+
+  it("defaults public gateway CORS to the gateway origin when no explicit allowlist is provided", () => {
+    process.env.GATEWAY_PUBLIC_BASE_URL = "https://gateway.example.test/hermes-gateway";
+    process.env.APPROVAL_SECRET = "secret";
+
+    expect(getConfig()).toMatchObject({
+      allowedCorsOrigins: ["https://gateway.example.test"]
+    });
+  });
+
+  it("accepts an explicit comma-separated CORS allowlist", () => {
+    process.env.GATEWAY_ALLOWED_ORIGINS =
+      "https://docs.google.com, https://gateway.example.test , https://excel.officeapps.live.com";
+
+    expect(getConfig()).toMatchObject({
+      allowedCorsOrigins: [
+        "https://docs.google.com",
+        "https://gateway.example.test",
+        "https://excel.officeapps.live.com"
+      ]
+    });
+  });
+});

@@ -1,0 +1,114 @@
+import { config as loadEnv } from "dotenv";
+import { fileURLToPath } from "node:url";
+import { dirname, resolve } from "node:path";
+
+loadEnv();
+loadEnv({
+  path: resolve(dirname(fileURLToPath(import.meta.url)), "../../../../.env")
+});
+
+export type GatewayConfig = {
+  port: number;
+  environmentLabel: string;
+  serviceLabel: string;
+  gatewayPublicBaseUrl: string;
+  allowedCorsOrigins?: string[];
+  maxUploadBytes: number;
+  approvalSecret: string;
+  saveInvalidHermesDebugArtifacts: boolean;
+  hermesAgentBaseUrl?: string;
+  hermesAgentApiKey?: string;
+  hermesAgentModel?: string;
+  skillRegistryPath: string;
+};
+
+const LOCAL_GATEWAY_DEFAULT_ALLOWED_ORIGINS = [
+  "https://docs.google.com",
+  "https://excel.officeapps.live.com",
+  "https://localhost:3000",
+  "https://127.0.0.1:3000"
+] as const;
+
+function isLoopbackBaseUrl(value: string): boolean {
+  try {
+    const url = new URL(value);
+    return url.hostname === "127.0.0.1" || url.hostname === "localhost" || url.hostname === "::1";
+  } catch {
+    return false;
+  }
+}
+
+function parseBooleanEnv(value: string | undefined): boolean {
+  return value === "true" || value === "1";
+}
+
+function tryNormalizeOrigin(value: string): string | undefined {
+  const trimmed = value.trim();
+  if (!trimmed) {
+    return undefined;
+  }
+
+  if (trimmed === "*") {
+    return "*";
+  }
+
+  try {
+    return new URL(trimmed).origin;
+  } catch {
+    return undefined;
+  }
+}
+
+function getAllowedCorsOrigins(
+  gatewayPublicBaseUrl: string,
+  configuredOrigins: string | undefined
+): string[] {
+  const configured = String(configuredOrigins || "")
+    .split(",")
+    .map((value) => tryNormalizeOrigin(value))
+    .filter((value): value is string => Boolean(value));
+
+  if (configured.length > 0) {
+    return [...new Set(configured)];
+  }
+
+  if (isLoopbackBaseUrl(gatewayPublicBaseUrl)) {
+    return [...LOCAL_GATEWAY_DEFAULT_ALLOWED_ORIGINS];
+  }
+
+  const publicOrigin = tryNormalizeOrigin(gatewayPublicBaseUrl);
+  return publicOrigin ? [publicOrigin] : [];
+}
+
+export function getConfig(): GatewayConfig {
+  const gatewayPublicBaseUrl = process.env.GATEWAY_PUBLIC_BASE_URL ?? "http://127.0.0.1:8787";
+  const approvalSecret = process.env.APPROVAL_SECRET ?? "change-me";
+
+  if (approvalSecret === "change-me" && !isLoopbackBaseUrl(gatewayPublicBaseUrl)) {
+    throw new Error(
+      "APPROVAL_SECRET must be configured before exposing the gateway on a non-local base URL."
+    );
+  }
+
+  return {
+    port: Number(process.env.PORT ?? 8787),
+    environmentLabel: process.env.HERMES_ENVIRONMENT_LABEL ?? "local-dev",
+    serviceLabel: process.env.HERMES_SERVICE_LABEL ?? "hermes-gateway-local",
+    gatewayPublicBaseUrl,
+    allowedCorsOrigins: getAllowedCorsOrigins(
+      gatewayPublicBaseUrl,
+      process.env.GATEWAY_ALLOWED_ORIGINS
+    ),
+    maxUploadBytes: Number(process.env.MAX_UPLOAD_BYTES ?? 8_000_000),
+    approvalSecret,
+    saveInvalidHermesDebugArtifacts: parseBooleanEnv(process.env.HERMES_DEBUG_INVALID_RESPONSES),
+    hermesAgentBaseUrl:
+      process.env.HERMES_AGENT_BASE_URL ??
+      process.env.HERMES_BASE_URL ??
+      "http://127.0.0.1:8642/v1",
+    hermesAgentApiKey: process.env.HERMES_API_SERVER_KEY ?? process.env.HERMES_AGENT_API_KEY,
+    hermesAgentModel: process.env.HERMES_AGENT_MODEL ?? process.env.HERMES_AGENT_ID,
+    skillRegistryPath: process.env.SKILL_REGISTRY_PATH ??
+      "../../extensions/registry/skill-registry.json"
+  };
+}

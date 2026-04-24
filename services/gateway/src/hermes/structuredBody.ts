@@ -1,0 +1,1862 @@
+import { z } from "zod";
+import {
+  AnalysisReportPlanDataSchema,
+  AnalysisReportUpdateDataSchema,
+  AttachmentAnalysisDataSchema,
+  ChartPlanDataSchema,
+  ChartUpdateDataSchema,
+  CompositePlanDataSchema,
+  ChatDataSchema,
+  ConditionalFormatPlanDataSchema,
+  DataValidationPlanDataSchema,
+  DataCleanupPlanDataSchema,
+  DocumentSummaryDataSchema,
+  DownstreamProviderSchema,
+  ErrorDataSchema,
+  ExternalDataPlanDataSchema,
+  ExtractedTableDataSchema,
+  FormulaDataSchema,
+  NamedRangeUpdateDataSchema,
+  PivotTablePlanDataSchema,
+  PivotTableUpdateDataSchema,
+  RangeFormatUpdateDataSchema,
+  RangeFilterPlanDataSchema,
+  RangeSortPlanDataSchema,
+  RangeTransferPlanDataSchema,
+  SheetImportPlanDataSchema,
+  SheetStructureUpdateDataSchema,
+  SheetUpdateDataSchema,
+  WarningSchema,
+  WorkbookStructureUpdateDataSchema
+} from "@hermes/contracts";
+
+type JsonRecord = Record<string, unknown>;
+
+const STRUCTURED_BODY_TYPES = [
+  "chat",
+  "formula",
+  "composite_plan",
+  "workbook_structure_update",
+  "range_format_update",
+  "conditional_format_plan",
+  "sheet_structure_update",
+  "range_sort_plan",
+  "range_filter_plan",
+  "data_validation_plan",
+  "analysis_report_plan",
+  "pivot_table_plan",
+  "chart_plan",
+  "named_range_update",
+  "range_transfer_plan",
+  "data_cleanup_plan",
+  "analysis_report_update",
+  "pivot_table_update",
+  "chart_update",
+  "sheet_update",
+  "sheet_import_plan",
+  "external_data_plan",
+  "error",
+  "attachment_analysis",
+  "extracted_table",
+  "document_summary"
+] as const;
+
+type HermesStructuredBodyType = (typeof STRUCTURED_BODY_TYPES)[number];
+
+export function extractSingleJsonObjectText(content: string): string | null {
+  const trimmed = content.trim();
+  const fencedMatch = trimmed.match(/^```(?:json)?\s*([\s\S]*?)\s*```$/i);
+  const candidate = (fencedMatch ? fencedMatch[1] : trimmed).trim();
+
+  if (candidate.startsWith("{") && candidate.endsWith("}")) {
+    return candidate;
+  }
+
+  return null;
+}
+
+function isObject(value: unknown): value is JsonRecord {
+  return typeof value === "object" && value !== null;
+}
+
+function hasOwn(source: JsonRecord, key: string): boolean {
+  return Object.prototype.hasOwnProperty.call(source, key);
+}
+
+function pickFields(source: JsonRecord, keys: readonly string[]): JsonRecord {
+  const picked: JsonRecord = {};
+
+  for (const key of keys) {
+    if (hasOwn(source, key)) {
+      picked[key] = source[key];
+    }
+  }
+
+  return picked;
+}
+
+function normalizeWarningsValue(value: unknown): unknown {
+  if (!Array.isArray(value)) {
+    return value;
+  }
+
+  if (value.every((item) => typeof item === "string")) {
+    return value.map((message) => ({
+      code: "MODEL_WARNING",
+      message,
+      severity: "warning" as const
+    }));
+  }
+
+  return value.map((item) => {
+    if (!isObject(item)) {
+      return item;
+    }
+
+    const normalized = pickFields(item, ["code", "message", "severity", "field"]);
+    if (typeof normalized.severity === "string") {
+      const severity = normalized.severity.trim().toLowerCase();
+      normalized.severity =
+        severity === "low" || severity === "info"
+          ? "info"
+          : severity === "medium" || severity === "warn" || severity === "warning"
+          ? "warning"
+          : severity === "high" || severity === "critical" || severity === "error"
+          ? "error"
+          : normalized.severity;
+    }
+
+    return normalized;
+  });
+}
+
+function normalizeShapeValue(value: unknown): unknown {
+  if (!isObject(value)) {
+    return value;
+  }
+
+  return pickFields(value, ["rows", "columns"]);
+}
+
+function buildQualifiedRangeRef(sheet: unknown, range: unknown): string | undefined {
+  if (typeof sheet !== "string" || !sheet.trim() || typeof range !== "string" || !range.trim()) {
+    return undefined;
+  }
+
+  return `${sheet.trim()}!${range.trim()}`;
+}
+
+function humanizeIdentifier(value: string): string {
+  return value
+    .trim()
+    .replace(/[_-]+/g, " ")
+    .replace(/\s+/g, " ")
+    .replace(/\b\w/g, (match) => match.toUpperCase());
+}
+
+function inferAnalysisSectionType(value: string): string {
+  const normalized = value.trim().toLowerCase();
+
+  if (
+    normalized.includes("trend") ||
+    normalized.includes("velocity") ||
+    normalized.includes("momentum")
+  ) {
+    return "trends";
+  }
+
+  if (
+    normalized.includes("top") ||
+    normalized.includes("bottom") ||
+    normalized.includes("rank") ||
+    normalized.includes("leader")
+  ) {
+    return "top_bottom";
+  }
+
+  if (
+    normalized.includes("anomal") ||
+    normalized.includes("risk") ||
+    normalized.includes("breach") ||
+    normalized.includes("outlier") ||
+    normalized.includes("alert")
+  ) {
+    return "anomalies";
+  }
+
+  if (
+    normalized.includes("group") ||
+    normalized.includes("category") ||
+    normalized.includes("priority") ||
+    normalized.includes("region") ||
+    normalized.includes("channel") ||
+    normalized.includes("breakdown")
+  ) {
+    return "group_breakdown";
+  }
+
+  if (
+    normalized.includes("next") ||
+    normalized.includes("action") ||
+    normalized.includes("recommend") ||
+    normalized.includes("follow up")
+  ) {
+    return "next_actions";
+  }
+
+  return "summary_stats";
+}
+
+function normalizeAnalysisSectionLikeValue(
+  value: unknown,
+  sourceSheet?: unknown,
+  sourceRange?: unknown
+): unknown {
+  if (typeof value === "string" && value.trim()) {
+    const title = humanizeIdentifier(value);
+    const sourceRef = buildQualifiedRangeRef(sourceSheet, sourceRange);
+    return {
+      type: inferAnalysisSectionType(value),
+      title,
+      summary: `${title} section.`,
+      sourceRanges: sourceRef ? [sourceRef] : []
+    };
+  }
+
+  if (!isObject(value)) {
+    return value;
+  }
+
+  const normalized = pickFields(value, ["type", "title", "summary", "sourceRanges"]);
+  const inferredTitle = typeof normalized.title === "string" && normalized.title.trim().length > 0
+    ? normalized.title.trim()
+    : typeof value.type === "string" && value.type.trim().length > 0
+    ? humanizeIdentifier(value.type)
+    : undefined;
+
+  if (!normalized.type && typeof value.type === "string" && value.type.trim().length > 0) {
+    normalized.type = inferAnalysisSectionType(value.type);
+  }
+
+  if (!normalized.type && inferredTitle) {
+    normalized.type = inferAnalysisSectionType(inferredTitle);
+  }
+
+  if (!normalized.title && inferredTitle) {
+    normalized.title = inferredTitle;
+  }
+
+  if (
+    (!Array.isArray(normalized.sourceRanges) || normalized.sourceRanges.length === 0)
+  ) {
+    const sourceRef = buildQualifiedRangeRef(sourceSheet, sourceRange);
+    if (sourceRef) {
+      normalized.sourceRanges = [sourceRef];
+    }
+  }
+
+  if (
+    (!normalized.summary || typeof normalized.summary !== "string" || !normalized.summary.trim()) &&
+    typeof normalized.title === "string" &&
+    normalized.title.trim().length > 0
+  ) {
+    normalized.summary = `${normalized.title.trim()} section.`;
+  }
+
+  return normalized;
+}
+
+function normalizeChartSeriesValue(value: unknown): unknown {
+  if (!isObject(value)) {
+    return value;
+  }
+
+  const normalized = pickFields(value, ["field", "label"]);
+  const fieldCandidate = normalized.field;
+  const labelCandidate = normalized.label;
+  const nameCandidate = typeof value.name === "string" ? value.name.trim() : undefined;
+
+  if ((!fieldCandidate || typeof fieldCandidate !== "string" || !fieldCandidate.trim()) && nameCandidate) {
+    normalized.field = nameCandidate;
+  }
+
+  if (
+    (!normalized.label || typeof normalized.label !== "string" || !normalized.label.trim()) &&
+    nameCandidate
+  ) {
+    normalized.label = nameCandidate;
+  }
+
+  if (
+    (!normalized.field || typeof normalized.field !== "string" || !normalized.field.trim()) &&
+    typeof labelCandidate === "string" &&
+    labelCandidate.trim()
+  ) {
+    normalized.field = labelCandidate.trim();
+  }
+
+  return normalized;
+}
+
+function inferCleanupConfirmationLevel(operation: unknown): "standard" | "destructive" | undefined {
+  switch (operation) {
+    case "remove_blank_rows":
+    case "remove_duplicate_rows":
+    case "split_column":
+    case "join_columns":
+      return "destructive";
+    case "trim_whitespace":
+    case "normalize_case":
+    case "fill_down":
+    case "standardize_format":
+      return "standard";
+    default:
+      return undefined;
+  }
+}
+
+function inferCleanupOverwriteRisk(operation: unknown): "low" | "medium" | "high" | undefined {
+  switch (operation) {
+    case "remove_blank_rows":
+    case "remove_duplicate_rows":
+    case "split_column":
+    case "join_columns":
+      return "high";
+    case "standardize_format":
+      return "medium";
+    case "trim_whitespace":
+    case "normalize_case":
+    case "fill_down":
+      return "low";
+    default:
+      return undefined;
+  }
+}
+
+function inferStandardizeFormatDetails(explanation: unknown): { formatType?: string; formatPattern?: string } {
+  if (typeof explanation !== "string" || !explanation.trim()) {
+    return {};
+  }
+
+  const normalized = explanation.trim().toLowerCase();
+  const mentionsDate = /\b(date|dates|yyyy|mm|dd)\b/.test(normalized);
+  const mentionsNumeric = /\b(currency|currencies|number|numeric|price|revenue|amount|amounts|usd|\$)\b/.test(normalized);
+
+  if (mentionsDate && !mentionsNumeric) {
+    return {
+      formatType: "date_text",
+      formatPattern: "yyyy-mm-dd"
+    };
+  }
+
+  if (mentionsNumeric && !mentionsDate) {
+    return {
+      formatType: "number_text",
+      formatPattern: "#,##0.00"
+    };
+  }
+
+  return {};
+}
+
+function normalizeOverwriteRiskValue(value: unknown): unknown {
+  if (typeof value !== "string") {
+    return value;
+  }
+
+  const normalized = value.trim().toLowerCase();
+  if (
+    normalized === "none" ||
+    normalized === "low" ||
+    normalized === "medium" ||
+    normalized === "high"
+  ) {
+    return normalized;
+  }
+
+  if (!normalized) {
+    return value;
+  }
+
+  if (
+    normalized.includes("delete") ||
+    normalized.includes("remove") ||
+    normalized.includes("clear") ||
+    normalized.includes("drop") ||
+    normalized.includes("destroy") ||
+    normalized.includes("entire sheet") ||
+    normalized.includes("entire range") ||
+    normalized.includes("all existing")
+  ) {
+    return "high";
+  }
+
+  if (
+    normalized.includes("replace") &&
+    (normalized.includes("formula") ||
+      normalized.includes("cell") ||
+      normalized.includes("note") ||
+      normalized.includes("format"))
+  ) {
+    return "low";
+  }
+
+  if (
+    normalized.includes("anchor") &&
+    (normalized.includes("formula") || normalized.includes("cell"))
+  ) {
+    return "low";
+  }
+
+  if (
+    normalized.includes("overwrite") ||
+    normalized.includes("replace") ||
+    normalized.includes("existing")
+  ) {
+    return "medium";
+  }
+
+  if (
+    normalized.includes("append") ||
+    normalized.includes("add without replacing") ||
+    normalized.includes("non-destructive")
+  ) {
+    return "none";
+  }
+
+  return value;
+}
+
+function normalizeDownstreamProviderValue(value: unknown): unknown {
+  if (value === null) {
+    return null;
+  }
+
+  if (typeof value === "string" && value.trim().length > 0) {
+    return { label: value.trim() };
+  }
+
+  if (!isObject(value)) {
+    return value;
+  }
+
+  return pickFields(value, ["label", "model"]);
+}
+
+function normalizeAlternateFormulas(value: unknown): unknown {
+  if (!Array.isArray(value)) {
+    return value;
+  }
+
+  return value.map((item) => {
+    if (typeof item === "string" && item.trim().length > 0) {
+      return {
+        formula: item.trim(),
+        explanation: "Alternative formulation."
+      };
+    }
+
+    return isObject(item)
+      ? pickFields(item, ["formula", "explanation"])
+      : item;
+  });
+}
+
+function normalizeChatData(value: unknown): unknown {
+  if (!isObject(value)) {
+    return value;
+  }
+
+  return pickFields(value, ["message", "followUpSuggestions", "confidence"]);
+}
+
+function normalizeFormulaData(value: unknown): unknown {
+  if (!isObject(value)) {
+    return value;
+  }
+
+  const normalized = pickFields(value, [
+    "intent",
+    "targetCell",
+    "formula",
+    "formulaLanguage",
+    "explanation",
+    "confidence",
+    "requiresConfirmation"
+  ]);
+
+  if (hasOwn(value, "alternateFormulas")) {
+    normalized.alternateFormulas = normalizeAlternateFormulas(value.alternateFormulas);
+  }
+
+  return normalized;
+}
+
+type CompositeStepPlanType =
+  | "sheet_update"
+  | "sheet_import_plan"
+  | "workbook_structure_update"
+  | "range_format_update"
+  | "conditional_format_plan"
+  | "sheet_structure_update"
+  | "range_sort_plan"
+  | "range_filter_plan"
+  | "data_validation_plan"
+  | "analysis_report_plan"
+  | "pivot_table_plan"
+  | "chart_plan"
+  | "named_range_update"
+  | "range_transfer_plan"
+  | "data_cleanup_plan"
+  | "external_data_plan";
+
+type CompositeStepPlanNormalizer = {
+  type: CompositeStepPlanType;
+  matches(value: JsonRecord): boolean;
+};
+
+const SHEET_STRUCTURE_UPDATE_OPERATIONS = new Set([
+  "insert_rows",
+  "delete_rows",
+  "hide_rows",
+  "unhide_rows",
+  "group_rows",
+  "ungroup_rows",
+  "insert_columns",
+  "delete_columns",
+  "hide_columns",
+  "unhide_columns",
+  "group_columns",
+  "ungroup_columns",
+  "merge_cells",
+  "unmerge_cells",
+  "freeze_panes",
+  "unfreeze_panes",
+  "autofit_rows",
+  "autofit_columns",
+  "set_sheet_tab_color"
+]);
+
+const COMPOSITE_STEP_PLAN_NORMALIZERS: CompositeStepPlanNormalizer[] = [
+  {
+    type: "sheet_update",
+    matches: (value) => hasOwn(value, "formulas") || hasOwn(value, "values") || hasOwn(value, "notes")
+  },
+  {
+    type: "sheet_import_plan",
+    matches: (value) => hasOwn(value, "sourceAttachmentId") || hasOwn(value, "extractionMode")
+  },
+  {
+    type: "external_data_plan",
+    matches: (value) => hasOwn(value, "sourceType") && hasOwn(value, "provider") && hasOwn(value, "formula")
+  },
+  {
+    type: "workbook_structure_update",
+    matches: (value) => hasOwn(value, "sheetName") && !hasOwn(value, "targetSheet")
+  },
+  {
+    type: "range_format_update",
+    matches: (value) => hasOwn(value, "format")
+  },
+  {
+    type: "conditional_format_plan",
+    matches: (value) => hasOwn(value, "managementMode") || hasOwn(value, "replacesExistingRules")
+  },
+  {
+    type: "sheet_structure_update",
+    matches: (value) =>
+      hasOwn(value, "targetSheet") &&
+      typeof value.operation === "string" &&
+      SHEET_STRUCTURE_UPDATE_OPERATIONS.has(value.operation)
+  },
+  {
+    type: "range_sort_plan",
+    matches: (value) => hasOwn(value, "keys")
+  },
+  {
+    type: "range_filter_plan",
+    matches: (value) => hasOwn(value, "conditions") && hasOwn(value, "combiner")
+  },
+  {
+    type: "data_validation_plan",
+    matches: (value) => hasOwn(value, "ruleType")
+  },
+  {
+    type: "analysis_report_plan",
+    matches: (value) => hasOwn(value, "outputMode")
+  },
+  {
+    type: "pivot_table_plan",
+    matches: (value) => hasOwn(value, "rowGroups") || hasOwn(value, "valueAggregations")
+  },
+  {
+    type: "chart_plan",
+    matches: (value) => hasOwn(value, "chartType") && hasOwn(value, "series")
+  },
+  {
+    type: "named_range_update",
+    matches: (value) => hasOwn(value, "scope") && hasOwn(value, "name")
+  },
+  {
+    type: "range_transfer_plan",
+    matches: (value) => hasOwn(value, "pasteMode") || hasOwn(value, "transpose")
+  },
+  {
+    type: "data_cleanup_plan",
+    matches: (value) => hasOwn(value, "keyColumns") || hasOwn(value, "mode") || hasOwn(value, "sourceColumn") || hasOwn(value, "formatType")
+  }
+];
+
+function isWrappedCompositeStepPlanEnvelope(
+  value: JsonRecord
+): value is JsonRecord & { type: CompositeStepPlanType; data: unknown } {
+  return (
+    typeof value.type === "string" &&
+    hasOwn(value, "data") &&
+    COMPOSITE_STEP_PLAN_NORMALIZERS.some((candidate) => candidate.type === value.type)
+  );
+}
+
+function normalizeStructuredBodyDataByType(type: HermesStructuredBodyType, value: unknown): unknown {
+  const normalized = normalizeHermesStructuredBodyInput({
+    type,
+    data: value
+  });
+
+  if (!isObject(normalized) || !hasOwn(normalized, "data")) {
+    return value;
+  }
+
+  return normalized.data;
+}
+
+function normalizeCompositeStepPlanValue(value: unknown): unknown {
+  if (!isObject(value)) {
+    return value;
+  }
+
+  if (isWrappedCompositeStepPlanEnvelope(value)) {
+    const normalized = normalizeStructuredBodyDataByType(value.type, value.data);
+
+    if (!isObject(normalized)) {
+      return normalized;
+    }
+
+    switch (value.type) {
+      case "sheet_structure_update":
+        return pickFields(normalized, [
+          "targetSheet",
+          "operation",
+          "startIndex",
+          "count",
+          "targetRange",
+          "frozenRows",
+          "frozenColumns",
+          "color",
+          "explanation",
+          "confidence",
+          "requiresConfirmation",
+          "confirmationLevel",
+          "affectedRanges",
+          "overwriteRisk"
+        ]);
+      case "range_sort_plan":
+        return pickFields(normalized, [
+          "targetSheet",
+          "targetRange",
+          "hasHeader",
+          "keys",
+          "explanation",
+          "confidence",
+          "requiresConfirmation",
+          "affectedRanges"
+        ]);
+      case "range_filter_plan":
+        return pickFields(normalized, [
+          "targetSheet",
+          "targetRange",
+          "hasHeader",
+          "conditions",
+          "combiner",
+          "clearExistingFilters",
+          "explanation",
+          "confidence",
+          "requiresConfirmation",
+          "affectedRanges"
+        ]);
+      default:
+        return normalized;
+    }
+  }
+
+  for (const candidate of COMPOSITE_STEP_PLAN_NORMALIZERS) {
+    if (candidate.matches(value)) {
+      const normalized = normalizeStructuredBodyDataByType(candidate.type, value);
+
+      if (!isObject(normalized)) {
+        return normalized;
+      }
+
+      switch (candidate.type) {
+        case "sheet_structure_update":
+          return pickFields(normalized, [
+            "targetSheet",
+            "operation",
+            "startIndex",
+            "count",
+            "targetRange",
+            "frozenRows",
+            "frozenColumns",
+            "color",
+            "explanation",
+            "confidence",
+            "requiresConfirmation",
+            "confirmationLevel",
+            "affectedRanges",
+            "overwriteRisk"
+          ]);
+        case "range_sort_plan":
+          return pickFields(normalized, [
+            "targetSheet",
+            "targetRange",
+            "hasHeader",
+            "keys",
+            "explanation",
+            "confidence",
+            "requiresConfirmation",
+            "affectedRanges"
+          ]);
+        case "range_filter_plan":
+          return pickFields(normalized, [
+            "targetSheet",
+            "targetRange",
+            "hasHeader",
+            "conditions",
+            "combiner",
+            "clearExistingFilters",
+            "explanation",
+            "confidence",
+            "requiresConfirmation",
+            "affectedRanges"
+          ]);
+        default:
+          return normalized;
+      }
+    }
+  }
+
+  return value;
+}
+
+function normalizeCompositePlanStepValue(value: unknown): unknown {
+  if (!isObject(value)) {
+    return value;
+  }
+
+  const normalized = pickFields(value, [
+    "stepId",
+    "dependsOn",
+    "continueOnError",
+    "plan"
+  ]);
+
+  if (hasOwn(value, "dependsOn") && Array.isArray(value.dependsOn)) {
+    normalized.dependsOn = [...value.dependsOn];
+  }
+
+  if (hasOwn(value, "plan")) {
+    normalized.plan = normalizeCompositeStepPlanValue(value.plan);
+  }
+
+  return normalized;
+}
+
+function normalizeCompositePlanData(value: unknown): unknown {
+  if (!isObject(value)) {
+    return value;
+  }
+
+  const normalized = pickFields(value, [
+    "steps",
+    "explanation",
+    "confidence",
+    "requiresConfirmation",
+    "affectedRanges",
+    "overwriteRisk",
+    "confirmationLevel",
+    "reversible",
+    "dryRunRecommended",
+    "dryRunRequired"
+  ]);
+
+  if (hasOwn(value, "steps") && Array.isArray(value.steps)) {
+    normalized.steps = value.steps.map((item) => normalizeCompositePlanStepValue(item));
+  }
+
+  if (hasOwn(value, "affectedRanges") && Array.isArray(value.affectedRanges)) {
+    normalized.affectedRanges = [...value.affectedRanges];
+  }
+
+  if (hasOwn(normalized, "overwriteRisk")) {
+    normalized.overwriteRisk = normalizeOverwriteRiskValue(normalized.overwriteRisk);
+  }
+
+  const normalizedSteps = Array.isArray(normalized.steps) ? normalized.steps : [];
+  const hasDestructiveStep = normalizedSteps.some((step) =>
+    isObject(step) &&
+    isObject(step.plan) &&
+    step.plan.confirmationLevel === "destructive"
+  );
+  normalized.confirmationLevel = hasDestructiveStep ? "destructive" : "standard";
+  // Composite workflows do not have an exact inverse execution path across hosts yet.
+  normalized.reversible = false;
+
+  return normalized;
+}
+
+function normalizeWorkbookStructureUpdateData(value: unknown): unknown {
+  if (!isObject(value)) {
+    return value;
+  }
+
+  const normalized = pickFields(value, [
+    "operation",
+    "sheetName",
+    "newSheetName",
+    "position",
+    "explanation",
+    "confidence",
+    "requiresConfirmation",
+    "overwriteRisk"
+  ]);
+
+  if (hasOwn(normalized, "overwriteRisk")) {
+    normalized.overwriteRisk = normalizeOverwriteRiskValue(normalized.overwriteRisk);
+  }
+
+  return normalized;
+}
+
+function normalizeRangeFormatValue(value: unknown): unknown {
+  if (!isObject(value)) {
+    return value;
+  }
+
+  return pickFields(value, [
+    "numberFormat",
+    "backgroundColor",
+    "textColor",
+    "bold",
+    "italic",
+    "horizontalAlignment",
+    "verticalAlignment",
+    "wrapStrategy",
+    "columnWidth",
+    "rowHeight"
+  ]);
+}
+
+function normalizeRangeFormatUpdateData(value: unknown): unknown {
+  if (!isObject(value)) {
+    return value;
+  }
+
+  const normalized = pickFields(value, [
+    "targetSheet",
+    "targetRange",
+    "explanation",
+    "confidence",
+    "requiresConfirmation",
+    "overwriteRisk"
+  ]);
+
+  if (hasOwn(value, "format")) {
+    normalized.format = normalizeRangeFormatValue(value.format);
+  }
+
+  if (hasOwn(normalized, "overwriteRisk")) {
+    normalized.overwriteRisk = normalizeOverwriteRiskValue(normalized.overwriteRisk);
+  }
+
+  return normalized;
+}
+
+function normalizeConditionalFormatStyleValue(value: unknown): unknown {
+  if (!isObject(value)) {
+    return value;
+  }
+
+  return pickFields(value, [
+    "backgroundColor",
+    "textColor",
+    "bold",
+    "italic",
+    "underline",
+    "strikethrough",
+    "numberFormat"
+  ]);
+}
+
+function normalizeConditionalFormatColorScalePointValue(value: unknown): unknown {
+  if (!isObject(value)) {
+    return value;
+  }
+
+  return pickFields(value, [
+    "type",
+    "value",
+    "color"
+  ]);
+}
+
+function normalizeConditionalFormatPlanData(value: unknown): unknown {
+  if (!isObject(value)) {
+    return value;
+  }
+
+  const normalized = pickFields(value, [
+    "targetSheet",
+    "targetRange",
+    "explanation",
+    "confidence",
+    "requiresConfirmation",
+    "affectedRanges",
+    "replacesExistingRules",
+    "managementMode",
+    "ruleType",
+    "comparator",
+    "value",
+    "value2",
+    "text",
+    "formula",
+    "rank",
+    "direction"
+  ]);
+
+  if (hasOwn(value, "affectedRanges") && Array.isArray(value.affectedRanges)) {
+    normalized.affectedRanges = [...value.affectedRanges];
+  }
+
+  if (hasOwn(value, "style")) {
+    normalized.style = normalizeConditionalFormatStyleValue(value.style);
+  } else if (hasOwn(value, "format")) {
+    normalized.style = normalizeConditionalFormatStyleValue(value.format);
+  }
+
+  if (hasOwn(value, "rule") && isObject(value.rule)) {
+    const rule = value.rule;
+    if (!hasOwn(normalized, "ruleType") && hasOwn(rule, "ruleType")) {
+      normalized.ruleType = rule.ruleType;
+    }
+    if (!hasOwn(normalized, "comparator") && hasOwn(rule, "comparator")) {
+      normalized.comparator = rule.comparator;
+    }
+    if (!hasOwn(normalized, "value") && hasOwn(rule, "value")) {
+      normalized.value = rule.value;
+    }
+    if (!hasOwn(normalized, "value2") && hasOwn(rule, "value2")) {
+      normalized.value2 = rule.value2;
+    }
+    if (!hasOwn(normalized, "text") && hasOwn(rule, "text")) {
+      normalized.text = rule.text;
+    }
+    if (!hasOwn(normalized, "formula")) {
+      if (hasOwn(rule, "formula")) {
+        normalized.formula = rule.formula;
+      } else if (hasOwn(rule, "customFormula")) {
+        normalized.formula = rule.customFormula;
+      }
+    }
+    if (!hasOwn(normalized, "rank") && hasOwn(rule, "rank")) {
+      normalized.rank = rule.rank;
+    }
+    if (!hasOwn(normalized, "direction") && hasOwn(rule, "direction")) {
+      normalized.direction = rule.direction;
+    }
+    if (!hasOwn(normalized, "style")) {
+      if (hasOwn(rule, "style")) {
+        normalized.style = normalizeConditionalFormatStyleValue(rule.style);
+      } else if (hasOwn(rule, "format")) {
+        normalized.style = normalizeConditionalFormatStyleValue(rule.format);
+      }
+    }
+    if (!hasOwn(normalized, "points") && hasOwn(rule, "points") && Array.isArray(rule.points)) {
+      normalized.points = rule.points.map((item) => normalizeConditionalFormatColorScalePointValue(item));
+    }
+  }
+
+  if (hasOwn(value, "points") && Array.isArray(value.points)) {
+    normalized.points = value.points.map((item) => normalizeConditionalFormatColorScalePointValue(item));
+  }
+
+  if (!hasOwn(normalized, "formula") && hasOwn(value, "customFormula")) {
+    normalized.formula = value.customFormula;
+  }
+
+  if (
+    (!Array.isArray(normalized.affectedRanges) || normalized.affectedRanges.length === 0)
+  ) {
+    const targetRef = buildQualifiedRangeRef(normalized.targetSheet, normalized.targetRange);
+    if (targetRef) {
+      normalized.affectedRanges = [targetRef];
+    }
+  }
+
+  return normalized;
+}
+
+function normalizeSheetStructureUpdateData(value: unknown): unknown {
+  if (!isObject(value)) {
+    return value;
+  }
+
+  const normalized: JsonRecord = { ...value };
+
+  if (hasOwn(value, "affectedRanges") && Array.isArray(value.affectedRanges)) {
+    normalized.affectedRanges = [...value.affectedRanges];
+  }
+
+  return normalized;
+}
+
+function normalizeRangeSortPlanData(value: unknown): unknown {
+  if (!isObject(value)) {
+    return value;
+  }
+
+  const normalized: JsonRecord = { ...value };
+
+  if (hasOwn(value, "keys") && Array.isArray(value.keys)) {
+    normalized.keys = value.keys.map((item) => {
+      if (!isObject(item)) {
+        return item;
+      }
+
+      const normalizedItem = pickFields(item, ["columnRef", "direction", "sortOn"]);
+      if (
+        (!normalizedItem.columnRef || typeof normalizedItem.columnRef !== "string") &&
+        typeof item.field === "string" &&
+        item.field.trim()
+      ) {
+        normalizedItem.columnRef = item.field.trim();
+      }
+
+      if (typeof normalizedItem.direction === "string") {
+        const direction = normalizedItem.direction.trim().toLowerCase();
+        normalizedItem.direction =
+          direction === "ascending" ? "asc"
+          : direction === "descending" ? "desc"
+          : direction;
+      }
+
+      return normalizedItem;
+    });
+  }
+
+  if (hasOwn(value, "affectedRanges") && Array.isArray(value.affectedRanges)) {
+    normalized.affectedRanges = [...value.affectedRanges];
+  }
+
+  return normalized;
+}
+
+function normalizeRangeFilterPlanData(value: unknown): unknown {
+  if (!isObject(value)) {
+    return value;
+  }
+
+  const normalized: JsonRecord = { ...value };
+
+  if (hasOwn(value, "conditions") && Array.isArray(value.conditions)) {
+    normalized.conditions = value.conditions.map((item) => isObject(item)
+      ? pickFields(item, ["columnRef", "operator", "value", "value2"])
+      : item);
+  }
+
+  if (hasOwn(value, "affectedRanges") && Array.isArray(value.affectedRanges)) {
+    normalized.affectedRanges = [...value.affectedRanges];
+  }
+
+  return normalized;
+}
+
+function normalizeDataValidationPlanData(value: unknown): unknown {
+  if (!isObject(value)) {
+    return value;
+  }
+
+  const normalized = pickFields(value, [
+    "targetSheet",
+    "targetRange",
+    "ruleType",
+    "values",
+    "sourceRange",
+    "namedRangeName",
+    "showDropdown",
+    "allowBlank",
+    "invalidDataBehavior",
+    "checkedValue",
+    "uncheckedValue",
+    "comparator",
+    "value",
+    "value2",
+    "formula",
+    "helpText",
+    "explanation",
+    "confidence",
+    "requiresConfirmation",
+    "affectedRanges",
+    "replacesExistingValidation"
+  ]);
+
+  if (hasOwn(value, "values") && Array.isArray(value.values)) {
+    normalized.values = [...value.values];
+  }
+
+  if (hasOwn(value, "affectedRanges") && Array.isArray(value.affectedRanges)) {
+    normalized.affectedRanges = [...value.affectedRanges];
+  }
+
+  return normalized;
+}
+
+function normalizeNamedRangeUpdateData(value: unknown): unknown {
+  if (!isObject(value)) {
+    return value;
+  }
+
+  const normalized = pickFields(value, [
+    "operation",
+    "scope",
+    "name",
+    "sheetName",
+    "targetSheet",
+    "targetRange",
+    "newName",
+    "explanation",
+    "confidence",
+    "requiresConfirmation",
+    "affectedRanges",
+    "overwriteRisk"
+  ]);
+
+  if (hasOwn(value, "affectedRanges") && Array.isArray(value.affectedRanges)) {
+    normalized.affectedRanges = [...value.affectedRanges];
+  }
+
+  if (hasOwn(normalized, "overwriteRisk")) {
+    normalized.overwriteRisk = normalizeOverwriteRiskValue(normalized.overwriteRisk);
+  }
+
+  return normalized;
+}
+
+function normalizeAnalysisReportSection(value: unknown): unknown {
+  if (!isObject(value)) {
+    return value;
+  }
+
+  const normalized = pickFields(value, ["type", "title", "summary", "sourceRanges"]);
+
+  if (hasOwn(value, "sourceRanges") && Array.isArray(value.sourceRanges)) {
+    normalized.sourceRanges = [...value.sourceRanges];
+  }
+
+  return normalized;
+}
+
+function normalizeAnalysisReportPlanData(value: unknown): unknown {
+  if (!isObject(value)) {
+    return value;
+  }
+
+  const normalized = pickFields(value, [
+    "sourceSheet",
+    "sourceRange",
+    "targetSheet",
+    "targetRange",
+    "outputMode",
+    "explanation",
+    "confidence",
+    "requiresConfirmation",
+    "affectedRanges",
+    "overwriteRisk",
+    "confirmationLevel"
+  ]);
+
+  if (hasOwn(value, "sections") && Array.isArray(value.sections)) {
+    normalized.sections = value.sections.map((item) =>
+      normalizeAnalysisSectionLikeValue(item, value.sourceSheet, value.sourceRange)
+    );
+  }
+
+  if (hasOwn(value, "affectedRanges") && Array.isArray(value.affectedRanges)) {
+    normalized.affectedRanges = [...value.affectedRanges];
+  }
+
+  if (
+    (!Array.isArray(normalized.affectedRanges) || normalized.affectedRanges.length === 0)
+  ) {
+    const refs = [
+      buildQualifiedRangeRef(normalized.sourceSheet, normalized.sourceRange),
+      normalized.outputMode === "materialize_report"
+        ? buildQualifiedRangeRef(normalized.targetSheet, normalized.targetRange)
+        : undefined
+    ].filter((item): item is string => typeof item === "string" && item.length > 0);
+    if (refs.length > 0) {
+      normalized.affectedRanges = refs;
+    }
+  }
+
+  if (hasOwn(normalized, "overwriteRisk")) {
+    normalized.overwriteRisk = normalizeOverwriteRiskValue(normalized.overwriteRisk);
+  } else if (normalized.outputMode === "chat_only") {
+    normalized.overwriteRisk = "none";
+  } else if (normalized.outputMode === "materialize_report") {
+    normalized.overwriteRisk = "low";
+  }
+
+  if (
+    (!normalized.confirmationLevel || typeof normalized.confirmationLevel !== "string") &&
+    normalized.outputMode === "materialize_report"
+  ) {
+    normalized.confirmationLevel = "standard";
+  }
+
+  if (
+    normalized.outputMode === "chat_only" &&
+    (!normalized.confirmationLevel || typeof normalized.confirmationLevel !== "string")
+  ) {
+    normalized.confirmationLevel = "standard";
+  }
+
+  return normalized;
+}
+
+function normalizePivotTablePlanData(value: unknown): unknown {
+  if (!isObject(value)) {
+    return value;
+  }
+
+  const normalized = pickFields(value, [
+    "sourceSheet",
+    "sourceRange",
+    "targetSheet",
+    "targetRange",
+    "rowGroups",
+    "columnGroups",
+    "valueAggregations",
+    "filters",
+    "sort",
+    "explanation",
+    "confidence",
+    "requiresConfirmation",
+    "affectedRanges",
+    "overwriteRisk",
+    "confirmationLevel"
+  ]);
+
+  if (hasOwn(value, "rowGroups") && Array.isArray(value.rowGroups)) {
+    normalized.rowGroups = [...value.rowGroups];
+  }
+
+  if (hasOwn(value, "columnGroups") && Array.isArray(value.columnGroups)) {
+    normalized.columnGroups = [...value.columnGroups];
+  }
+
+  if (hasOwn(value, "valueAggregations") && Array.isArray(value.valueAggregations)) {
+    normalized.valueAggregations = value.valueAggregations.map((item) => isObject(item) ? { ...item } : item);
+  }
+
+  if (hasOwn(value, "filters") && Array.isArray(value.filters)) {
+    normalized.filters = value.filters.map((item) => isObject(item) ? { ...item } : item);
+  }
+
+  if (hasOwn(value, "sort") && isObject(value.sort)) {
+    normalized.sort = { ...value.sort };
+  }
+
+  if (hasOwn(value, "affectedRanges") && Array.isArray(value.affectedRanges)) {
+    normalized.affectedRanges = [...value.affectedRanges];
+  }
+
+  if (hasOwn(normalized, "overwriteRisk")) {
+    normalized.overwriteRisk = normalizeOverwriteRiskValue(normalized.overwriteRisk);
+  }
+
+  return normalized;
+}
+
+function normalizeChartPlanData(value: unknown): unknown {
+  if (!isObject(value)) {
+    return value;
+  }
+
+  const normalized = pickFields(value, [
+    "sourceSheet",
+    "sourceRange",
+    "targetSheet",
+    "targetRange",
+    "chartType",
+    "categoryField",
+    "title",
+    "legendPosition",
+    "explanation",
+    "confidence",
+    "requiresConfirmation",
+    "affectedRanges",
+    "overwriteRisk",
+    "confirmationLevel"
+  ]);
+
+  if (hasOwn(value, "series") && Array.isArray(value.series)) {
+    normalized.series = value.series.map((item) => normalizeChartSeriesValue(item));
+  }
+
+  if (hasOwn(value, "affectedRanges") && Array.isArray(value.affectedRanges)) {
+    normalized.affectedRanges = [...value.affectedRanges];
+  }
+
+  if (hasOwn(normalized, "legendPosition") && normalized.legendPosition === "none") {
+    normalized.legendPosition = "hidden";
+  }
+
+  if (hasOwn(normalized, "overwriteRisk")) {
+    normalized.overwriteRisk = normalizeOverwriteRiskValue(normalized.overwriteRisk);
+  } else {
+    normalized.overwriteRisk = "low";
+  }
+
+  if (
+    (!Array.isArray(normalized.affectedRanges) || normalized.affectedRanges.length === 0)
+  ) {
+    const refs = [
+      buildQualifiedRangeRef(normalized.sourceSheet, normalized.sourceRange),
+      buildQualifiedRangeRef(normalized.targetSheet, normalized.targetRange)
+    ].filter((item): item is string => typeof item === "string" && item.length > 0);
+    if (refs.length > 0) {
+      normalized.affectedRanges = refs;
+    }
+  }
+
+  if (!normalized.confirmationLevel || typeof normalized.confirmationLevel !== "string") {
+    normalized.confirmationLevel = "standard";
+  }
+
+  return normalized;
+}
+
+function normalizeExternalDataPlanData(value: unknown): unknown {
+  if (!isObject(value)) {
+    return value;
+  }
+
+  const normalized = pickFields(value, [
+    "sourceType",
+    "provider",
+    "targetSheet",
+    "targetRange",
+    "formula",
+    "sourceUrl",
+    "selectorType",
+    "selector",
+    "explanation",
+    "confidence",
+    "requiresConfirmation",
+    "affectedRanges",
+    "overwriteRisk",
+    "confirmationLevel"
+  ]);
+
+  if (hasOwn(value, "query") && isObject(value.query)) {
+    normalized.query = pickFields(value.query, [
+      "symbol",
+      "attribute",
+      "startDate",
+      "endDate",
+      "interval"
+    ]);
+  }
+
+  if (hasOwn(value, "affectedRanges") && Array.isArray(value.affectedRanges)) {
+    normalized.affectedRanges = [...value.affectedRanges];
+  }
+
+  if (hasOwn(normalized, "overwriteRisk")) {
+    normalized.overwriteRisk = normalizeOverwriteRiskValue(normalized.overwriteRisk);
+  } else {
+    normalized.overwriteRisk = "low";
+  }
+
+  if (
+    (!Array.isArray(normalized.affectedRanges) || normalized.affectedRanges.length === 0) &&
+    typeof normalized.targetSheet === "string" &&
+    typeof normalized.targetRange === "string"
+  ) {
+    normalized.affectedRanges = [`${normalized.targetSheet}!${normalized.targetRange}`];
+  }
+
+  if (!normalized.confirmationLevel || typeof normalized.confirmationLevel !== "string") {
+    normalized.confirmationLevel = "standard";
+  }
+
+  return normalized;
+}
+
+function normalizeSheetUpdateData(value: unknown): unknown {
+  if (!isObject(value)) {
+    return value;
+  }
+
+  const normalized = pickFields(value, [
+    "targetSheet",
+    "targetRange",
+    "operation",
+    "values",
+    "formulas",
+    "notes",
+    "explanation",
+    "confidence",
+    "requiresConfirmation",
+    "overwriteRisk"
+  ]);
+
+  if (hasOwn(value, "shape")) {
+    normalized.shape = normalizeShapeValue(value.shape);
+  }
+
+  if (normalized.operation === "set_values") {
+    normalized.operation = "replace_range";
+  } else if (
+    normalized.operation === "set_formulas" &&
+    (hasOwn(normalized, "values") || hasOwn(normalized, "notes"))
+  ) {
+    normalized.operation = "mixed_update";
+  } else if (
+    normalized.operation === "set_notes" &&
+    (hasOwn(normalized, "values") || hasOwn(normalized, "formulas"))
+  ) {
+    normalized.operation = "mixed_update";
+  }
+
+  if (hasOwn(normalized, "overwriteRisk")) {
+    normalized.overwriteRisk = normalizeOverwriteRiskValue(normalized.overwriteRisk);
+  }
+
+  return normalized;
+}
+
+function normalizeRangeTransferPlanData(value: unknown): unknown {
+  if (!isObject(value)) {
+    return value;
+  }
+
+  const normalized = pickFields(value, [
+    "sourceSheet",
+    "sourceRange",
+    "targetSheet",
+    "targetRange",
+    "operation",
+    "pasteMode",
+    "transpose",
+    "explanation",
+    "confidence",
+    "requiresConfirmation",
+    "affectedRanges",
+    "overwriteRisk",
+    "confirmationLevel"
+  ]);
+
+  if (hasOwn(value, "affectedRanges") && Array.isArray(value.affectedRanges)) {
+    normalized.affectedRanges = [...value.affectedRanges];
+  }
+
+  if (hasOwn(normalized, "overwriteRisk")) {
+    normalized.overwriteRisk = normalizeOverwriteRiskValue(normalized.overwriteRisk);
+  }
+
+  return normalized;
+}
+
+function normalizeDataCleanupPlanData(value: unknown): unknown {
+  if (!isObject(value)) {
+    return value;
+  }
+
+  const normalized = pickFields(value, [
+    "targetSheet",
+    "targetRange",
+    "operation",
+    "keyColumns",
+    "mode",
+    "sourceColumn",
+    "delimiter",
+    "targetStartColumn",
+    "sourceColumns",
+    "targetColumn",
+    "columns",
+    "formatType",
+    "formatPattern",
+    "explanation",
+    "confidence",
+    "requiresConfirmation",
+    "affectedRanges",
+    "overwriteRisk",
+    "confirmationLevel"
+  ]);
+
+  if (hasOwn(value, "keyColumns") && Array.isArray(value.keyColumns)) {
+    normalized.keyColumns = [...value.keyColumns];
+  }
+
+  if (hasOwn(value, "sourceColumns") && Array.isArray(value.sourceColumns)) {
+    normalized.sourceColumns = [...value.sourceColumns];
+  }
+
+  if (hasOwn(value, "columns") && Array.isArray(value.columns)) {
+    normalized.columns = [...value.columns];
+  }
+
+  if (normalized.operation === "trim") {
+    normalized.operation = "trim_whitespace";
+  } else if (normalized.operation === "remove_duplicates") {
+    normalized.operation = "remove_duplicate_rows";
+  } else if (normalized.operation === "standardize_case") {
+    normalized.operation = "normalize_case";
+  }
+
+  if (typeof normalized.formatType === "string") {
+    const formatType = normalized.formatType.trim().toLowerCase();
+    normalized.formatType =
+      formatType.includes("currency") || formatType.includes("number") || formatType.includes("numeric")
+        ? "number_text"
+        : formatType.includes("date")
+        ? "date_text"
+        : formatType;
+  }
+
+  if (
+    normalized.operation === "normalize_case" &&
+    (!normalized.mode || typeof normalized.mode !== "string")
+  ) {
+    normalized.mode = "title";
+  }
+
+  if (hasOwn(value, "affectedRanges") && Array.isArray(value.affectedRanges)) {
+    normalized.affectedRanges = [...value.affectedRanges];
+  }
+
+  if (hasOwn(normalized, "overwriteRisk")) {
+    normalized.overwriteRisk = normalizeOverwriteRiskValue(normalized.overwriteRisk);
+  } else {
+    const inferredOverwriteRisk = inferCleanupOverwriteRisk(normalized.operation);
+    if (inferredOverwriteRisk) {
+      normalized.overwriteRisk = inferredOverwriteRisk;
+    }
+  }
+
+  if (
+    (!Array.isArray(normalized.affectedRanges) || normalized.affectedRanges.length === 0)
+  ) {
+    const targetRef = buildQualifiedRangeRef(normalized.targetSheet, normalized.targetRange);
+    if (targetRef) {
+      normalized.affectedRanges = [targetRef];
+    }
+  }
+
+  if (!normalized.confirmationLevel || typeof normalized.confirmationLevel !== "string") {
+    const inferredConfirmationLevel = inferCleanupConfirmationLevel(normalized.operation);
+    if (inferredConfirmationLevel) {
+      normalized.confirmationLevel = inferredConfirmationLevel;
+    }
+  }
+
+  if (normalized.operation === "standardize_format") {
+    const inferredFormat = inferStandardizeFormatDetails(normalized.explanation);
+    if (
+      (!normalized.formatType || typeof normalized.formatType !== "string") &&
+      inferredFormat.formatType
+    ) {
+      normalized.formatType = inferredFormat.formatType;
+    }
+    if (
+      (!normalized.formatPattern || typeof normalized.formatPattern !== "string") &&
+      inferredFormat.formatPattern
+    ) {
+      normalized.formatPattern = inferredFormat.formatPattern;
+    }
+  }
+
+  return normalized;
+}
+
+function normalizeAnalysisReportUpdateData(value: unknown): unknown {
+  if (!isObject(value)) {
+    return value;
+  }
+
+  return pickFields(value, ["operation", "targetSheet", "targetRange", "summary"]);
+}
+
+function normalizePivotTableUpdateData(value: unknown): unknown {
+  if (!isObject(value)) {
+    return value;
+  }
+
+  return pickFields(value, ["operation", "targetSheet", "targetRange", "summary"]);
+}
+
+function normalizeChartUpdateData(value: unknown): unknown {
+  if (!isObject(value)) {
+    return value;
+  }
+
+  return pickFields(value, ["operation", "targetSheet", "targetRange", "chartType", "summary"]);
+}
+
+function normalizeSheetImportPlanData(value: unknown): unknown {
+  if (!isObject(value)) {
+    return value;
+  }
+
+  const normalized = pickFields(value, [
+    "sourceAttachmentId",
+    "targetSheet",
+    "targetRange",
+    "headers",
+    "values",
+    "confidence",
+    "requiresConfirmation",
+    "extractionMode"
+  ]);
+
+  if (hasOwn(value, "warnings")) {
+    normalized.warnings = normalizeWarningsValue(value.warnings);
+  }
+
+  if (hasOwn(value, "shape")) {
+    normalized.shape = normalizeShapeValue(value.shape);
+  }
+
+  return normalized;
+}
+
+function normalizeErrorData(value: unknown): unknown {
+  if (!isObject(value)) {
+    return value;
+  }
+
+  const normalized = pickFields(value, ["code", "message", "retryable", "userAction"]);
+
+  if (normalized.code === "MISSING_REQUIRED_CONTEXT") {
+    normalized.code = "SPREADSHEET_CONTEXT_MISSING";
+  }
+
+  return normalized;
+}
+
+function normalizeAttachmentAnalysisData(value: unknown): unknown {
+  if (!isObject(value)) {
+    return value;
+  }
+
+  const normalized = pickFields(value, [
+    "sourceAttachmentId",
+    "contentKind",
+    "summary",
+    "confidence",
+    "extractionMode"
+  ]);
+
+  if (hasOwn(value, "warnings")) {
+    normalized.warnings = normalizeWarningsValue(value.warnings);
+  }
+
+  return normalized;
+}
+
+function normalizeExtractedTableData(value: unknown): unknown {
+  if (!isObject(value)) {
+    return value;
+  }
+
+  const normalized = pickFields(value, [
+    "sourceAttachmentId",
+    "headers",
+    "rows",
+    "confidence",
+    "extractionMode"
+  ]);
+
+  if (hasOwn(value, "warnings")) {
+    normalized.warnings = normalizeWarningsValue(value.warnings);
+  }
+
+  if (hasOwn(value, "shape")) {
+    normalized.shape = normalizeShapeValue(value.shape);
+  }
+
+  return normalized;
+}
+
+function normalizeDocumentSummaryData(value: unknown): unknown {
+  if (!isObject(value)) {
+    return value;
+  }
+
+  const normalized = pickFields(value, [
+    "sourceAttachmentId",
+    "summary",
+    "contentKind",
+    "keyPoints",
+    "confidence",
+    "extractionMode"
+  ]);
+
+  if (hasOwn(value, "warnings")) {
+    normalized.warnings = normalizeWarningsValue(value.warnings);
+  }
+
+  return normalized;
+}
+
+function normalizeDataByType(type: HermesStructuredBodyType, value: unknown): unknown {
+  switch (type) {
+    case "chat":
+      return normalizeChatData(value);
+    case "formula":
+      return normalizeFormulaData(value);
+    case "composite_plan":
+      return normalizeCompositePlanData(value);
+    case "workbook_structure_update":
+      return normalizeWorkbookStructureUpdateData(value);
+    case "range_format_update":
+      return normalizeRangeFormatUpdateData(value);
+    case "conditional_format_plan":
+      return normalizeConditionalFormatPlanData(value);
+    case "sheet_structure_update":
+      return normalizeSheetStructureUpdateData(value);
+    case "range_sort_plan":
+      return normalizeRangeSortPlanData(value);
+    case "range_filter_plan":
+      return normalizeRangeFilterPlanData(value);
+    case "data_validation_plan":
+      return normalizeDataValidationPlanData(value);
+    case "analysis_report_plan":
+      return normalizeAnalysisReportPlanData(value);
+    case "pivot_table_plan":
+      return normalizePivotTablePlanData(value);
+    case "chart_plan":
+      return normalizeChartPlanData(value);
+    case "external_data_plan":
+      return normalizeExternalDataPlanData(value);
+    case "named_range_update":
+      return normalizeNamedRangeUpdateData(value);
+    case "range_transfer_plan":
+      return normalizeRangeTransferPlanData(value);
+    case "data_cleanup_plan":
+      return normalizeDataCleanupPlanData(value);
+    case "analysis_report_update":
+      return normalizeAnalysisReportUpdateData(value);
+    case "pivot_table_update":
+      return normalizePivotTableUpdateData(value);
+    case "chart_update":
+      return normalizeChartUpdateData(value);
+    case "sheet_update":
+      return normalizeSheetUpdateData(value);
+    case "sheet_import_plan":
+      return normalizeSheetImportPlanData(value);
+    case "error":
+      return normalizeErrorData(value);
+    case "attachment_analysis":
+      return normalizeAttachmentAnalysisData(value);
+    case "extracted_table":
+      return normalizeExtractedTableData(value);
+    case "document_summary":
+      return normalizeDocumentSummaryData(value);
+  }
+}
+
+export function normalizeHermesStructuredBodyInput(value: unknown): unknown {
+  if (!isObject(value) || typeof value.type !== "string") {
+    return value;
+  }
+
+  if (!STRUCTURED_BODY_TYPES.includes(value.type as HermesStructuredBodyType)) {
+    return value;
+  }
+
+  const type = value.type as HermesStructuredBodyType;
+  const normalized: JsonRecord = {
+    type
+  };
+
+  if (hasOwn(value, "data")) {
+    normalized.data = normalizeDataByType(type, value.data);
+  }
+
+  if (hasOwn(value, "warnings")) {
+    normalized.warnings = normalizeWarningsValue(value.warnings);
+  }
+
+  if (hasOwn(value, "skillsUsed")) {
+    normalized.skillsUsed = value.skillsUsed;
+  }
+
+  if (hasOwn(value, "downstreamProvider")) {
+    normalized.downstreamProvider = normalizeDownstreamProviderValue(value.downstreamProvider);
+  }
+
+  return normalized;
+}
+
+const optionalWarningsSchema = z.preprocess(
+  normalizeWarningsValue,
+  z.array(WarningSchema).optional()
+);
+const optionalSkillsUsedSchema = z.array(z.string().min(1).max(128)).optional();
+const optionalDownstreamProviderSchema = DownstreamProviderSchema.optional();
+
+function createStructuredBodySchema<
+  TypeName extends string,
+  DataSchema extends z.ZodTypeAny
+>(typeName: TypeName, dataSchema: DataSchema) {
+  return z.object({
+    type: z.literal(typeName),
+    data: dataSchema,
+    warnings: optionalWarningsSchema,
+    skillsUsed: optionalSkillsUsedSchema,
+    downstreamProvider: optionalDownstreamProviderSchema
+  }).strict();
+}
+
+export const HermesStructuredBodySchema = z.discriminatedUnion("type", [
+  createStructuredBodySchema("chat", ChatDataSchema),
+  createStructuredBodySchema("formula", FormulaDataSchema),
+  createStructuredBodySchema("composite_plan", CompositePlanDataSchema),
+  createStructuredBodySchema("workbook_structure_update", WorkbookStructureUpdateDataSchema),
+  createStructuredBodySchema("range_format_update", RangeFormatUpdateDataSchema),
+  createStructuredBodySchema("conditional_format_plan", ConditionalFormatPlanDataSchema),
+  createStructuredBodySchema("sheet_structure_update", SheetStructureUpdateDataSchema),
+  createStructuredBodySchema("range_sort_plan", RangeSortPlanDataSchema),
+  createStructuredBodySchema("range_filter_plan", RangeFilterPlanDataSchema),
+  createStructuredBodySchema("data_validation_plan", DataValidationPlanDataSchema),
+  createStructuredBodySchema("analysis_report_plan", AnalysisReportPlanDataSchema),
+  createStructuredBodySchema("pivot_table_plan", PivotTablePlanDataSchema),
+  createStructuredBodySchema("chart_plan", ChartPlanDataSchema),
+  createStructuredBodySchema("external_data_plan", ExternalDataPlanDataSchema),
+  createStructuredBodySchema("named_range_update", NamedRangeUpdateDataSchema),
+  createStructuredBodySchema("range_transfer_plan", RangeTransferPlanDataSchema),
+  createStructuredBodySchema("data_cleanup_plan", DataCleanupPlanDataSchema),
+  createStructuredBodySchema("analysis_report_update", AnalysisReportUpdateDataSchema),
+  createStructuredBodySchema("pivot_table_update", PivotTableUpdateDataSchema),
+  createStructuredBodySchema("chart_update", ChartUpdateDataSchema),
+  createStructuredBodySchema("sheet_update", SheetUpdateDataSchema),
+  createStructuredBodySchema("sheet_import_plan", SheetImportPlanDataSchema),
+  createStructuredBodySchema("error", ErrorDataSchema),
+  createStructuredBodySchema("attachment_analysis", AttachmentAnalysisDataSchema),
+  createStructuredBodySchema("extracted_table", ExtractedTableDataSchema),
+  createStructuredBodySchema("document_summary", DocumentSummaryDataSchema)
+]);
+
+export type HermesStructuredBody = z.infer<typeof HermesStructuredBodySchema>;
