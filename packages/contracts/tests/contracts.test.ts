@@ -497,7 +497,20 @@ describe("Hermes spreadsheet contracts", () => {
           {
             stepId: "step_sort",
             status: "completed",
-            summary: "Sorted Sales rows."
+            summary: "Sorted Sales rows.",
+            result: {
+              kind: "range_sort",
+              hostPlatform: "excel_windows",
+              targetSheet: "Sales",
+              targetRange: "A1:F50",
+              hasHeader: true,
+              keys: [{ columnRef: "Revenue", direction: "desc" }],
+              explanation: "Sort by revenue.",
+              confidence: 0.91,
+              requiresConfirmation: true,
+              affectedRanges: ["Sales!A1:F50"],
+              summary: "Sorted Sales rows."
+            }
           }
         ],
         summary: "Completed the composite update."

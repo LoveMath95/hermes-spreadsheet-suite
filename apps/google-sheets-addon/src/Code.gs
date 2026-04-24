@@ -3121,6 +3121,20 @@ function attachLocalExecutionSnapshot_(result, snapshot) {
   return nextResult;
 }
 
+function stripLocalExecutionSnapshot_(result) {
+  if (!result || typeof result !== 'object' || Array.isArray(result)) {
+    return result;
+  }
+
+  const nextResult = {};
+  Object.keys(result).forEach(function(key) {
+    if (key !== '__hermesLocalExecutionSnapshot') {
+      nextResult[key] = result[key];
+    }
+  });
+  return nextResult;
+}
+
 function resolveExecutionCellSnapshot_(input) {
   if (!input || typeof input !== 'object') {
     throw new Error('Execution snapshot payload is required.');
@@ -4472,7 +4486,8 @@ function applyCompositePlan_(input) {
       stepResults.push({
         stepId: step.stepId,
         status: 'completed',
-        summary: getCompositeStepWritebackStatusLine_(step.plan, result)
+        summary: getCompositeStepWritebackStatusLine_(step.plan, result),
+        result: stripLocalExecutionSnapshot_(result)
       });
       completedSteps[step.stepId] = true;
     } catch (error) {

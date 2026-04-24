@@ -5766,7 +5766,8 @@ async function applyCompositePlan({ plan, requestId, runId, approvalToken, execu
       stepResults.push({
         stepId: step.stepId,
         status: "completed",
-        summary: getCompositeStepWritebackStatusLine(step.plan, result)
+        summary: getCompositeStepWritebackStatusLine(step.plan, result),
+        result: stripLocalExecutionSnapshot(result)
       });
       completedSteps.add(step.stepId);
     } catch (error) {

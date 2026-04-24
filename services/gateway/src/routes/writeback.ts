@@ -441,34 +441,41 @@ const CompositeWritebackResultSchema = CompositeUpdateDataSchema.extend({
   hostPlatform: HostPlatformSchema
 });
 
+const ChildCompletionResultSchema = z.union([
+  RangeWritebackResultSchema,
+  RangeFormatWritebackResultSchema,
+  WorkbookStructureWritebackResultSchema,
+  SheetStructureWritebackResultSchema,
+  RangeSortWritebackResultSchema,
+  RangeFilterWritebackResultSchema,
+  DataValidationWritebackResultSchema,
+  ConditionalFormatWritebackResultSchema,
+  NamedRangeWritebackResultSchema,
+  RangeTransferWritebackResultSchema,
+  DataCleanupWritebackResultSchema,
+  AnalysisReportWritebackResultSchema,
+  ExternalDataWritebackResultSchema,
+  PivotTableWritebackResultSchema,
+  ChartWritebackResultSchema
+]);
+
+const CompletionResultSchema = z.union([
+  ChildCompletionResultSchema,
+  CompositeWritebackResultSchema
+]);
+
 const CompletionRequestSchema = z.object({
   requestId: z.string().min(1),
   runId: z.string().min(1),
   workbookSessionKey: z.string().min(1).max(256).optional(),
   approvalToken: z.string().min(1),
   planDigest: z.string().min(1),
-  result: z.union([
-    RangeWritebackResultSchema,
-    RangeFormatWritebackResultSchema,
-    WorkbookStructureWritebackResultSchema,
-    SheetStructureWritebackResultSchema,
-    RangeSortWritebackResultSchema,
-    RangeFilterWritebackResultSchema,
-    DataValidationWritebackResultSchema,
-    ConditionalFormatWritebackResultSchema,
-    NamedRangeWritebackResultSchema,
-    RangeTransferWritebackResultSchema,
-    DataCleanupWritebackResultSchema,
-    AnalysisReportWritebackResultSchema,
-    ExternalDataWritebackResultSchema,
-    PivotTableWritebackResultSchema,
-    ChartWritebackResultSchema,
-    CompositeWritebackResultSchema
-  ])
+  result: CompletionResultSchema
 });
 
 type ApprovalPlan = z.infer<typeof ApprovalRequestSchema>["plan"];
 type CompletionResult = z.infer<typeof CompletionRequestSchema>["result"];
+type ChildCompletionResult = z.infer<typeof ChildCompletionResultSchema>;
 type MaterializedAnalysisReportPlan = Extract<AnalysisReportPlanData, { outputMode: "materialize_report" }>;
 type ResolvedMaterializedAnalysisReportPlan =
   MaterializedAnalysisReportPlan & { targetSheet: string; targetRange: string };
@@ -917,6 +924,57 @@ function assertRangeTransferCompletionMatchesApprovedPlan(
   }
 }
 
+const ApprovalPlanResponseTypeCandidates: Array<{
+  type: HermesResponse["type"];
+  schema: { safeParse: (input: unknown) => { success: boolean } };
+}> = [
+  { type: "sheet_import_plan", schema: SheetImportPlanDataSchema },
+  { type: "sheet_update", schema: SheetUpdateDataSchema },
+  { type: "external_data_plan", schema: ExternalDataPlanDataSchema },
+  { type: "workbook_structure_update", schema: WorkbookStructureUpdateDataSchema },
+  { type: "range_format_update", schema: RangeFormatUpdateDataSchema },
+  { type: "conditional_format_plan", schema: ConditionalFormatPlanDataSchema },
+  { type: "sheet_structure_update", schema: SheetStructureUpdateDataSchema },
+  { type: "range_sort_plan", schema: RangeSortPlanDataSchema },
+  { type: "range_filter_plan", schema: RangeFilterPlanDataSchema },
+  { type: "data_validation_plan", schema: DataValidationPlanDataSchema },
+  { type: "named_range_update", schema: NamedRangeUpdateDataSchema },
+  { type: "range_transfer_plan", schema: RangeTransferPlanDataSchema },
+  { type: "data_cleanup_plan", schema: DataCleanupPlanDataSchema },
+  { type: "analysis_report_plan", schema: AnalysisReportPlanDataSchema },
+  { type: "pivot_table_plan", schema: PivotTablePlanDataSchema },
+  { type: "chart_plan", schema: ChartPlanDataSchema }
+];
+
+function getResponseTypeForApprovalPlan(plan: ApprovalPlan): HermesResponse["type"] | undefined {
+  return ApprovalPlanResponseTypeCandidates.find((candidate) =>
+    candidate.schema.safeParse(plan).success
+  )?.type;
+}
+
+function assertChildCompletionMatchesApprovedPlan(
+  plan: ApprovalPlan,
+  result: ChildCompletionResult
+): void {
+  const responseType = getResponseTypeForApprovalPlan(plan);
+  if (!responseType) {
+    throw new Error("Writeback result does not match the approved plan details.");
+  }
+
+  const expectedResultKind = getExpectedResultKind({
+    type: responseType,
+    data: plan
+  } as HermesResponse);
+  if (!expectedResultKind || result.kind !== expectedResultKind) {
+    throw new Error("Writeback result does not match the approved plan details.");
+  }
+
+  assertCompletionMatchesApprovedPlan({
+    type: responseType,
+    data: plan
+  } as HermesResponse, result);
+}
+
 function assertCompositeCompletionMatchesApprovedPlan(
   plan: CompositePlanData,
   result: z.infer<typeof CompositeWritebackResultSchema>
@@ -976,6 +1034,13 @@ function assertCompositeCompletionMatchesApprovedPlan(
 
     switch (stepResult.status) {
       case "completed":
+        {
+          const parsedChildResult = ChildCompletionResultSchema.safeParse(stepResult.result);
+          if (!parsedChildResult.success) {
+            throw new Error("Writeback result does not match the approved plan details.");
+          }
+          assertChildCompletionMatchesApprovedPlan(expectedStep.plan, parsedChildResult.data);
+        }
         completedSteps.add(stepResult.stepId);
         break;
       case "failed":
