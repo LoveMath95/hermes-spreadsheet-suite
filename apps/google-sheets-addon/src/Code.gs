@@ -1441,6 +1441,16 @@ function applyPivotTablePlan_(spreadsheet, plan) {
     throw new Error('Google Sheets host does not expose pivot creation on this range.');
   }
 
+  const anchorDisplayValues = typeof anchorRange.getDisplayValues === 'function'
+    ? anchorRange.getDisplayValues()
+    : anchorRange.getValues();
+  const anchorFormulas = typeof anchorRange.getFormulas === 'function'
+    ? anchorRange.getFormulas()
+    : [];
+  if (rangeHasExistingContent_(anchorDisplayValues) || hasAnyRealFormula_(anchorFormulas)) {
+    throw new Error('Target range already contains content.');
+  }
+
   const headerMap = buildHeaderMap_(sourceRange);
   validatePivotTableFieldReferences_(headerMap, planState);
   validatePivotTableCapabilities_(planState);

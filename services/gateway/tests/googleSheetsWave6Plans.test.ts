@@ -2729,6 +2729,95 @@ describe("Google Sheets wave 6 composite plans and execution controls", () => {
     expect(chartSheet.insertChart).toHaveBeenCalledWith(builtChart);
   });
 
+  it("fails closed before creating a Google Sheets pivot table when the anchor already contains content", () => {
+    [
+      {
+        displayValues: [["Existing"]],
+        formulas: [[""]]
+      },
+      {
+        displayValues: [[""]],
+        formulas: [["=SUM(A:A)"]]
+      }
+    ].forEach((anchorContent) => {
+      const pivotSourceRange = createRangeStub({
+        a1Notation: "A1:B20",
+        row: 1,
+        column: 1,
+        numRows: 20,
+        numColumns: 2,
+        displayValues: [
+          ["Region", "Revenue"]
+        ]
+      });
+      const pivotAnchorRange = createRangeStub({
+        a1Notation: "A1",
+        row: 1,
+        column: 1,
+        numRows: 1,
+        numColumns: 1,
+        displayValues: anchorContent.displayValues,
+        formulas: anchorContent.formulas
+      });
+      const pivotTable = {
+        addRowGroup: vi.fn(),
+        addColumnGroup: vi.fn(),
+        addPivotValue: vi.fn(),
+        addFilter: vi.fn()
+      };
+      pivotAnchorRange.createPivotTable = vi.fn(() => pivotTable);
+      const spreadsheet = {
+        getId() {
+          return "sheet-123";
+        },
+        getSheetByName: vi.fn((sheetName: string) => {
+          if (sheetName === "Sales") {
+            return {
+              getRange: vi.fn((rangeA1: string) => {
+                expect(rangeA1).toBe("A1:B20");
+                return pivotSourceRange;
+              })
+            };
+          }
+
+          if (sheetName === "Sales Pivot") {
+            return {
+              getRange: vi.fn((rangeA1: string) => {
+                expect(rangeA1).toBe("A1");
+                return pivotAnchorRange;
+              })
+            };
+          }
+
+          return null;
+        })
+      };
+      const code = loadCodeModule({ spreadsheet });
+
+      expect(() => code.applyWritePlan({
+        requestId: "req_pivot_anchor_content_apply_001",
+        runId: "run_pivot_anchor_content_apply_001",
+        approvalToken: "token",
+        executionId: "exec_pivot_anchor_content_apply_001",
+        plan: {
+          sourceSheet: "Sales",
+          sourceRange: "A1:B20",
+          targetSheet: "Sales Pivot",
+          targetRange: "A1",
+          rowGroups: ["Region"],
+          valueAggregations: [{ field: "Revenue", aggregation: "sum" }],
+          explanation: "Build a pivot table.",
+          confidence: 0.9,
+          requiresConfirmation: true,
+          affectedRanges: ["Sales!A1:B20", "Sales Pivot!A1"],
+          overwriteRisk: "low",
+          confirmationLevel: "standard"
+        }
+      })).toThrow("Target range already contains content.");
+      expect(pivotAnchorRange.createPivotTable).not.toHaveBeenCalled();
+    });
+  });
+
   it("fails closed when a composite step appears before an unsatisfied dependency in Code.gs execution order", () => {
     const code = loadCodeModule({
       spreadsheet: {
